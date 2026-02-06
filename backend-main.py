@@ -27,12 +27,20 @@ AI_AVAILABLE = False
 
 if API_KEY and API_KEY.startswith("sk-ant-"):
     try:
+        # ✅ FIXED: Don't pass any extra parameters that might conflict
         client = anthropic.Anthropic(api_key=API_KEY)
         AI_AVAILABLE = True
         print("✅ Claude AI enabled - API key loaded successfully")
     except Exception as e:
         print(f"⚠️  Claude AI initialization failed: {e}")
-        AI_AVAILABLE = False
+        # Try without any optional parameters
+        try:
+            client = anthropic.Anthropic(api_key=API_KEY)
+            AI_AVAILABLE = True
+            print("✅ Claude AI enabled on second attempt")
+        except Exception as e2:
+            print(f"⚠️  Claude AI still failed: {e2}")
+            AI_AVAILABLE = False
 else:
     print("⚠️  ANTHROPIC_API_KEY not found or invalid - running in fallback mode")
     print(f"    Current key value: {API_KEY[:20] if API_KEY else 'None'}...")
