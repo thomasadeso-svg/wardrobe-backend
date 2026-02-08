@@ -9,6 +9,8 @@ import json
 import random
 import requests
 from io import BytesIO
+import importlib
+import importlib.util
 
 app = FastAPI(title="AI Wardrobe API")
 
@@ -23,9 +25,11 @@ app.add_middleware(
 
 # Initialize Anthropic client
 API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-REMOVEBG_API_KEY = os.environ.get("REMOVEBG_API_KEY")  # NEW
+REMOVEBG_API_KEY = os.environ.get("REMOVEBG_API_KEY")
 AI_AVAILABLE = False
 BG_REMOVAL_AVAILABLE = False
+LOCAL_BG_REMOVAL_AVAILABLE = False
+rembg_remove = None
 
 if API_KEY and API_KEY.startswith("sk-ant-"):
     try:
@@ -40,6 +44,16 @@ if REMOVEBG_API_KEY:
     print("✅ Remove.bg enabled")
 else:
     print("⚠️  REMOVEBG_API_KEY not set - background removal disabled")
+
+rembg_spec = importlib.util.find_spec("rembg")
+pil_spec = importlib.util.find_spec("PIL")
+if rembg_spec and pil_spec:
+    rembg_module = importlib.import_module("rembg")
+    rembg_remove = rembg_module.remove
+    LOCAL_BG_REMOVAL_AVAILABLE = True
+    print("✅ Local background removal enabled (rembg)")
+else:
+    print("⚠️  rembg not available - local background removal disabled")
 
 class OutfitRequest(BaseModel):
     wardrobe: List[dict]
@@ -56,6 +70,7 @@ async def root():
         "service": "AI Wardrobe API",
         "ai_enabled": AI_AVAILABLE,
         "bg_removal_enabled": BG_REMOVAL_AVAILABLE,
+        "local_bg_removal_enabled": LOCAL_BG_REMOVAL_AVAILABLE,
         "endpoints": {
             "POST /analyze-clothing": "Analyze clothing images",
             "POST /generate-outfit": "Generate outfit suggestions",
@@ -63,54 +78,85 @@ async def root():
         }
     }
 
+@app.get("/remove-background")
+async def remove_background_help():
+    return {
+        "detail": "This endpoint requires a multipart POST with a 'file' field.",
+        "example_windows_cmd": (
+            "curl -X POST http://localhost:8000/remove-background "
+            "-F \"file=@C:\\\\Users\\\\YOUR_NAME\\\\Pictures\\\\image.jpg\""
+        ),
+        "example_linux_mac": (
+            "curl -X POST http://localhost:8000/remove-background "
+            "-F \"file=@/path/to/image.jpg\""
+        ),
+    }
+
 @app.post("/remove-background")
 async def remove_background(file: UploadFile = File(...)):
-    """Remove background from clothing image using Remove.bg API"""
-    
-    if not BG_REMOVAL_AVAILABLE:
-        # Return original image if Remove.bg not configured
-        contents = await file.read()
-        base64_image = base64.b64encode(contents).decode('utf-8')
-        return {
-            "image_base64": base64_image,
-            "note": "Background removal not configured - returning original image"
-        }
-    
+    """Remove background from clothing image using Remove.bg API or local rembg"""
+    contents = b""
     try:
         contents = await file.read()
-        
-        # Call Remove.bg API
-        response = requests.post(
-            'https://api.remove.bg/v1.0/removebg',
-            files={'image_file': BytesIO(contents)},
-            data={'size': 'auto'},
-            headers={'X-Api-Key': REMOVEBG_API_KEY},
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            # Convert processed image to base64
-            processed_image = base64.b64encode(response.content).decode('utf-8')
+        if not contents:
+            raise HTTPException(status_code=400, detail="Empty upload")
+        media_type = file.content_type or "image/jpeg"
+
+        # Try Remove.bg API first
+        if BG_REMOVAL_AVAILABLE:
+            response = requests.post(
+                "https://api.remove.bg/v1.0/removebg",
+                files={"image_file": ("upload", contents, media_type)},
+                data={"size": "auto", "format": "png"},
+                headers={"X-Api-Key": REMOVEBG_API_KEY},
+                timeout=30,
+            )
+
+            if response.status_code == 200:
+                processed_image = base64.b64encode(response.content).decode("utf-8")
+                return {
+                    "image_base64": processed_image,
+                    "image_content_type": "image/png",
+                    "success": True,
+                }
+
+            print(f"Remove.bg error: {response.status_code} - {response.text}")
+
+        # Fallback to local rembg
+        if LOCAL_BG_REMOVAL_AVAILABLE:
+            output = rembg_remove(contents)
+            if isinstance(output, bytes):
+                processed_bytes = output
+            else:
+                buffer = BytesIO()
+                output.save(buffer, format="PNG")
+                processed_bytes = buffer.getvalue()
+            processed_image = base64.b64encode(processed_bytes).decode("utf-8")
             return {
                 "image_base64": processed_image,
-                "success": True
+                "image_content_type": "image/png",
+                "success": True,
+                "note": "Remove.bg unavailable - used local rembg fallback",
             }
-        else:
-            # Return original if Remove.bg fails
-            print(f"Remove.bg error: {response.status_code} - {response.text}")
-            base64_image = base64.b64encode(contents).decode('utf-8')
-            return {
-                "image_base64": base64_image,
-                "note": f"Background removal failed: {response.status_code}",
-                "success": False
-            }
+
+        # If both methods fail, return original image
+        base64_image = base64.b64encode(contents).decode("utf-8")
+        return {
+            "image_base64": base64_image,
+            "image_content_type": media_type,
+            "note": "Background removal not configured - returning original image",
+            "success": False,
+        }
             
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Background removal error: {e}")
         # Return original image on error
-        base64_image = base64.b64encode(contents).decode('utf-8')
+        base64_image = base64.b64encode(contents).decode("utf-8")
         return {
             "image_base64": base64_image,
+            "image_content_type": file.content_type or "image/jpeg",
             "note": f"Background removal failed: {str(e)}",
             "success": False
         }
@@ -266,7 +312,7 @@ if __name__ == "__main__":
     print("🚀 AI Wardrobe Backend")
     print(f"AI: {'✅' if AI_AVAILABLE else '❌'}")
     print(f"BG Removal: {'✅' if BG_REMOVAL_AVAILABLE else '❌'}")
+    print(f"Local BG Removal: {'✅' if LOCAL_BG_REMOVAL_AVAILABLE else '❌'}")
     print("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
 
