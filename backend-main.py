@@ -7,8 +7,21 @@ import requests
 from PIL import Image
 import io
 import base64
-from rembg import remove
-import replicate
+
+# Try to import optional dependencies
+try:
+    from rembg import remove
+    REMBG_AVAILABLE = True
+except ImportError:
+    REMBG_AVAILABLE = False
+    print("⚠️ rembg not available - background removal will use Remove.bg API only")
+
+try:
+    import replicate
+    REPLICATE_AVAILABLE = True
+except ImportError:
+    REPLICATE_AVAILABLE = False
+    print("⚠️ replicate not available - mannequin generation will use basic compositing")
 
 app = FastAPI()
 
@@ -30,7 +43,15 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 @app.get("/")
 def read_root():
-    return {"message": "Wardrobe AI Backend is running! 🎨👔"}
+    return {
+        "message": "Wardrobe AI Backend is running! 🎨👔",
+        "features": {
+            "claude_ai": bool(ANTHROPIC_API_KEY),
+            "removebg": bool(REMOVEBG_API_KEY),
+            "rembg_local": REMBG_AVAILABLE,
+            "replicate": REPLICATE_AVAILABLE
+        }
+    }
 
 @app.post("/analyze-clothing")
 async def analyze_clothing(file: UploadFile = File(...)):
@@ -155,7 +176,7 @@ async def remove_background(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         
-        # Try Remove.bg API first
+        # Try Remove.bg API first (primary method)
         if REMOVEBG_API_KEY:
             try:
                 response = requests.post(
@@ -176,19 +197,32 @@ async def remove_background(file: UploadFile = File(...)):
             except Exception as e:
                 print(f"Remove.bg failed: {e}")
         
-        # Fallback to local rembg
-        input_image = Image.open(io.BytesIO(contents))
-        output_image = remove(input_image)
+        # Fallback to local rembg (if available)
+        if REMBG_AVAILABLE:
+            try:
+                input_image = Image.open(io.BytesIO(contents))
+                output_image = remove(input_image)
+                
+                # Convert to base64
+                buffered = io.BytesIO()
+                output_image.save(buffered, format="PNG")
+                result_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                
+                return JSONResponse(content={
+                    "success": True,
+                    "image": f"data:image/png;base64,{result_base64}",
+                    "method": "rembg"
+                })
+            except Exception as e:
+                print(f"Local rembg failed: {e}")
         
-        # Convert to base64
-        buffered = io.BytesIO()
-        output_image.save(buffered, format="PNG")
-        result_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-        
+        # If both fail, return original image
+        result_base64 = base64.b64encode(contents).decode('utf-8')
         return JSONResponse(content={
-            "success": True,
-            "image": f"data:image/png;base64,{result_base64}",
-            "method": "rembg"
+            "success": False,
+            "image": f"data:image/jpeg;base64,{result_base64}",
+            "method": "none",
+            "message": "Background removal not available - showing original image"
         })
         
     except Exception as e:
@@ -196,18 +230,15 @@ async def remove_background(file: UploadFile = File(...)):
 
 @app.post("/generate-mannequin")
 async def generate_mannequin(request: dict):
-    """Generate a dressed mannequin using Replicate AI"""
+    """Generate a dressed mannequin using AI compositing"""
     try:
-        outfit_items = request.get("items", [])  # List of base64 images
-        mannequin_style = request.get("style", "realistic")  # realistic/minimal/artistic
+        outfit_items = request.get("items", [])  # List of {image, category} objects
+        mannequin_style = request.get("style", "realistic")
         
         if not outfit_items:
             raise HTTPException(status_code=400, detail="No outfit items provided")
         
-        # For now, we'll use a simple compositing approach
-        # Later we can enhance with Replicate's image generation models
-        
-        # Create a composite image (basic version)
+        # Create a composite image
         composite = create_outfit_composite(outfit_items)
         
         # Convert to base64
@@ -215,10 +246,9 @@ async def generate_mannequin(request: dict):
         composite.save(buffered, format="PNG")
         composite_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         
-        # Use Replicate to enhance/stylize the composite
-        if REPLICATE_API_TOKEN:
+        # Use Replicate to enhance (if available)
+        if REPLICATE_AVAILABLE and REPLICATE_API_TOKEN:
             try:
-                # Using Stable Diffusion for image-to-image enhancement
                 output = replicate.run(
                     "stability-ai/stable-diffusion:db21e45d3f7023abc2a46ee38a23973f6dce16bb082a930b0c49861f96d1e5bf",
                     input={
@@ -229,7 +259,6 @@ async def generate_mannequin(request: dict):
                     }
                 )
                 
-                # Get the result URL and convert to base64
                 result_url = output[0] if isinstance(output, list) else output
                 result_response = requests.get(result_url)
                 result_base64 = base64.b64encode(result_response.content).decode('utf-8')
@@ -241,9 +270,9 @@ async def generate_mannequin(request: dict):
                 })
                 
             except Exception as e:
-                print(f"Replicate enhancement failed: {e}, returning basic composite")
+                print(f"Replicate enhancement failed: {e}")
         
-        # Return basic composite if Replicate fails
+        # Return basic composite
         return JSONResponse(content={
             "success": True,
             "image": f"data:image/png;base64,{composite_base64}",
@@ -254,12 +283,10 @@ async def generate_mannequin(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 def create_outfit_composite(items):
-    """Create a basic composite of outfit items layered on mannequin"""
-    # Create a blank canvas (mannequin base)
+    """Create a basic composite of outfit items"""
     width, height = 800, 1200
-    composite = Image.new('RGBA', (width, height), (255, 255, 255, 0))
+    composite = Image.new('RGBA', (width, height), (255, 255, 255, 255))
     
-    # Layer positions for different clothing types
     positions = {
         'shirt': (width//2, height//3),
         'pants': (width//2, height//2 + 100),
@@ -268,28 +295,20 @@ def create_outfit_composite(items):
         'dress': (width//2, height//2),
     }
     
-    # Layer each item
     for item in items:
         try:
-            # Decode base64 image
             image_data = item.get('image', '')
             if image_data.startswith('data:image'):
                 image_data = image_data.split(',')[1]
             
             img_bytes = base64.b64decode(image_data)
             img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
-            
-            # Resize to fit
             img.thumbnail((400, 400), Image.Resampling.LANCZOS)
             
-            # Get position based on category
             category = item.get('category', 'shirt').lower()
             pos = positions.get(category, (width//2, height//2))
-            
-            # Center the image at the position
             paste_pos = (pos[0] - img.width//2, pos[1] - img.height//2)
             
-            # Paste onto composite
             composite.paste(img, paste_pos, img)
             
         except Exception as e:
