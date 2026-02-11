@@ -4,5 +4,4 @@ anthropic
 requests
 pillow
 replicate
-rembg
 python-multipart
