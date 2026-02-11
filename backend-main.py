@@ -8,21 +8,6 @@ from PIL import Image
 import io
 import base64
 
-# Try to import optional dependencies
-try:
-    from rembg import remove
-    REMBG_AVAILABLE = True
-except ImportError:
-    REMBG_AVAILABLE = False
-    print("⚠️ rembg not available - background removal will use Remove.bg API only")
-
-try:
-    import replicate
-    REPLICATE_AVAILABLE = True
-except ImportError:
-    REPLICATE_AVAILABLE = False
-    print("⚠️ replicate not available - mannequin generation will use basic compositing")
-
 app = FastAPI()
 
 # CORS middleware
@@ -34,37 +19,208 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API Keys from environment
+# API Keys
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 REMOVEBG_API_KEY = os.getenv("REMOVEBG_API_KEY")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 @app.get("/")
 def read_root():
     return {
         "message": "Wardrobe AI Backend is running! 🎨👔",
+        "status": "online",
         "features": {
             "claude_ai": bool(ANTHROPIC_API_KEY),
             "removebg": bool(REMOVEBG_API_KEY),
-            "rembg_local": REMBG_AVAILABLE,
-            "replicate": REPLICATE_AVAILABLE
+            "replicate": bool(REPLICATE_API_TOKEN)
         }
     }
 
-@app.post("/analyze-clothing")
-async def analyze_clothing(file: UploadFile = File(...)):
-    """Analyze a clothing item using Claude AI"""
+@app.post("/generate-outfit")
+async def generate_outfit(request: dict):
+    """Generate outfit suggestions using Claude AI"""
     try:
-        # Read the image
-        contents = await file.read()
-        base64_image = base64.b64encode(contents).decode("utf-8")
+        wardrobe = request.get("wardrobe", [])
+        occasion = request.get("occasion", "casual")
+        weather = request.get("weather", "moderate")
         
-        # Determine media type
-        media_type = file.content_type or "image/jpeg"
+        if not wardrobe or len(wardrobe) < 2:
+            return JSONResponse(content={
+                "outfit": [{"item_index": 0}, {"item_index": 1}],
+                "explanation": "Add more items to your wardrobe for better suggestions!"
+            })
+        
+        if not client:
+            # Fallback if no API key
+            return JSONResponse(content={
+                "outfit": [{"item_index": 0}, {"item_index": min(1, len(wardrobe)-1)}],
+                "explanation": "Random outfit suggestion (AI offline)"
+            })
+        
+        # Build wardrobe text
+        wardrobe_text = "\n".join([
+            f"{i}. {item.get('category', 'item')}: {item.get('color', 'colored')} {item.get('style', 'style')}"
+            for i, item in enumerate(wardrobe)
+        ])
         
         # Call Claude API
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""Given this wardrobe:
+{wardrobe_text}
+
+Create an outfit for {occasion} in {weather} weather.
+
+Return ONLY valid JSON in this exact format (no markdown, no extra text):
+{{
+  "outfit": [
+    {{"item_index": 0}},
+    {{"item_index": 1}}
+  ],
+  "explanation": "Brief explanation of why this outfit works"
+}}
+
+Use item indices 0 to {len(wardrobe)-1}."""
+                }
+            ],
+        )
+        
+        # Parse response
+        response_text = message.content[0].text.strip()
+        
+        # Remove markdown code blocks if present
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+        
+        import json
+        result = json.loads(response_text)
+        
+        return JSONResponse(content=result)
+        
+    except Exception as e:
+        print(f"Outfit generation error: {str(e)}")
+        # Fallback response
+        return JSONResponse(content={
+            "outfit": [
+                {"item_index": 0},
+                {"item_index": min(1, len(wardrobe)-1)}
+            ],
+            "explanation": "Here's a suggested outfit combination!"
+        })
+
+@app.post("/remove-background")
+async def remove_background(file: UploadFile = File(...)):
+    """Remove background from image using Remove.bg API"""
+    try:
+        contents = await file.read()
+        
+        if not REMOVEBG_API_KEY:
+            print("❌ No Remove.bg API key found")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": "Remove.bg API key not configured",
+                    "image": None
+                }
+            )
+        
+        print(f"📤 Calling Remove.bg API... (file size: {len(contents)} bytes)")
+        
+        # Call Remove.bg API
+        response = requests.post(
+            'https://api.remove.bg/v1.0/removebg',
+            files={'image_file': ('image.jpg', contents, 'image/jpeg')},
+            data={'size': 'auto'},
+            headers={'X-Api-Key': REMOVEBG_API_KEY},
+            timeout=60  # Increased timeout
+        )
+        
+        print(f"📥 Remove.bg response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            result_base64 = base64.b64encode(response.content).decode('utf-8')
+            print("✅ Background removed successfully!")
+            return JSONResponse(content={
+                "success": True,
+                "image": f"data:image/png;base64,{result_base64}",
+                "method": "removebg"
+            })
+        elif response.status_code == 403:
+            print("❌ Remove.bg API key invalid or quota exceeded")
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "success": False,
+                    "error": "Remove.bg API key invalid or quota exceeded. Check your account at remove.bg",
+                    "image": None
+                }
+            )
+        elif response.status_code == 402:
+            print("❌ Remove.bg quota exceeded")
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "success": False,
+                    "error": "Remove.bg monthly quota exceeded. Upgrade your plan at remove.bg",
+                    "image": None
+                }
+            )
+        else:
+            error_msg = response.text
+            print(f"❌ Remove.bg API error: {error_msg}")
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "success": False,
+                    "error": f"Remove.bg API error: {error_msg}",
+                    "image": None
+                }
+            )
+        
+    except requests.Timeout:
+        print("❌ Remove.bg request timeout")
+        return JSONResponse(
+            status_code=504,
+            content={
+                "success": False,
+                "error": "Request timeout - image too large or slow connection",
+                "image": None
+            }
+        )
+    except Exception as e:
+        print(f"❌ Background removal error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(e),
+                "image": None
+            }
+        )
+
+@app.post("/analyze-clothing")
+async def analyze_clothing(file: UploadFile = File(...)):
+    """Analyze clothing item using Claude AI"""
+    try:
+        if not client:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Claude AI not configured"}
+            )
+        
+        contents = await file.read()
+        base64_image = base64.b64encode(contents).decode("utf-8")
+        media_type = file.content_type or "image/jpeg"
+        
         message = client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=1024,
@@ -96,9 +252,7 @@ async def analyze_clothing(file: UploadFile = File(...)):
             ],
         )
         
-        # Parse response
-        response_text = message.content[0].text
-        # Try to extract JSON if wrapped in markdown
+        response_text = message.content[0].text.strip()
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0].strip()
         elif "```" in response_text:
@@ -110,135 +264,22 @@ async def analyze_clothing(file: UploadFile = File(...)):
         return JSONResponse(content=analysis)
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/generate-outfit")
-async def generate_outfit(request: dict):
-    """Generate outfit suggestions using Claude AI"""
-    try:
-        wardrobe = request.get("wardrobe", [])
-        occasion = request.get("occasion", "casual day out")
-        weather = request.get("weather", "mild")
-        
-        # Build wardrobe description
-        wardrobe_text = "\n".join([
-            f"- {item['category']}: {item['color']} {item['style']} ({item['season']})"
-            for item in wardrobe
-        ])
-        
-        # Call Claude API
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=2048,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""Given this wardrobe:
-{wardrobe_text}
-
-Create 3 outfit combinations for: {occasion} in {weather} weather.
-
-Return ONLY a JSON object with this structure:
-{{
-  "outfits": [
-    {{
-      "name": "outfit name",
-      "items": ["item1 id", "item2 id", "item3 id"],
-      "description": "why this works",
-      "style_tips": "styling advice"
-    }}
-  ]
-}}
-
-Use the exact item descriptions from the wardrobe above."""
-                }
-            ],
-        )
-        
-        # Parse response
-        response_text = message.content[0].text
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0].strip()
-            
-        import json
-        outfits = json.loads(response_text)
-        
-        return JSONResponse(content=outfits)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/remove-background")
-async def remove_background(file: UploadFile = File(...)):
-    """Remove background from image"""
-    try:
-        contents = await file.read()
-        
-        # Try Remove.bg API first (primary method)
-        if REMOVEBG_API_KEY:
-            try:
-                response = requests.post(
-                    'https://api.remove.bg/v1.0/removebg',
-                    files={'image_file': contents},
-                    data={'size': 'auto'},
-                    headers={'X-Api-Key': REMOVEBG_API_KEY},
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    result_base64 = base64.b64encode(response.content).decode('utf-8')
-                    return JSONResponse(content={
-                        "success": True,
-                        "image": f"data:image/png;base64,{result_base64}",
-                        "method": "removebg"
-                    })
-            except Exception as e:
-                print(f"Remove.bg failed: {e}")
-        
-        # Fallback to local rembg (if available)
-        if REMBG_AVAILABLE:
-            try:
-                input_image = Image.open(io.BytesIO(contents))
-                output_image = remove(input_image)
-                
-                # Convert to base64
-                buffered = io.BytesIO()
-                output_image.save(buffered, format="PNG")
-                result_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-                
-                return JSONResponse(content={
-                    "success": True,
-                    "image": f"data:image/png;base64,{result_base64}",
-                    "method": "rembg"
-                })
-            except Exception as e:
-                print(f"Local rembg failed: {e}")
-        
-        # If both fail, return original image
-        result_base64 = base64.b64encode(contents).decode('utf-8')
-        return JSONResponse(content={
-            "success": False,
-            "image": f"data:image/jpeg;base64,{result_base64}",
-            "method": "none",
-            "message": "Background removal not available - showing original image"
-        })
-        
-    except Exception as e:
+        print(f"Clothing analysis error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate-mannequin")
 async def generate_mannequin(request: dict):
-    """Generate a dressed mannequin using AI compositing"""
+    """Generate mannequin composite"""
     try:
-        outfit_items = request.get("items", [])  # List of {image, category} objects
-        mannequin_style = request.get("style", "realistic")
+        outfit_items = request.get("items", [])
+        style = request.get("style", "realistic")
         
         if not outfit_items:
-            raise HTTPException(status_code=400, detail="No outfit items provided")
+            raise HTTPException(status_code=400, detail="No items provided")
         
-        # Create a composite image
+        print(f"🎨 Creating mannequin with {len(outfit_items)} items (style: {style})")
+        
+        # Create basic composite
         composite = create_outfit_composite(outfit_items)
         
         # Convert to base64
@@ -246,33 +287,8 @@ async def generate_mannequin(request: dict):
         composite.save(buffered, format="PNG")
         composite_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         
-        # Use Replicate to enhance (if available)
-        if REPLICATE_AVAILABLE and REPLICATE_API_TOKEN:
-            try:
-                output = replicate.run(
-                    "stability-ai/stable-diffusion:db21e45d3f7023abc2a46ee38a23973f6dce16bb082a930b0c49861f96d1e5bf",
-                    input={
-                        "image": f"data:image/png;base64,{composite_base64}",
-                        "prompt": f"professional fashion photography, {mannequin_style} mannequin wearing stylish outfit, clean white background, studio lighting",
-                        "num_inference_steps": 50,
-                        "guidance_scale": 7.5
-                    }
-                )
-                
-                result_url = output[0] if isinstance(output, list) else output
-                result_response = requests.get(result_url)
-                result_base64 = base64.b64encode(result_response.content).decode('utf-8')
-                
-                return JSONResponse(content={
-                    "success": True,
-                    "image": f"data:image/png;base64,{result_base64}",
-                    "method": "replicate-enhanced"
-                })
-                
-            except Exception as e:
-                print(f"Replicate enhancement failed: {e}")
+        print("✅ Mannequin created successfully!")
         
-        # Return basic composite
         return JSONResponse(content={
             "success": True,
             "image": f"data:image/png;base64,{composite_base64}",
@@ -280,39 +296,71 @@ async def generate_mannequin(request: dict):
         })
         
     except Exception as e:
+        print(f"❌ Mannequin error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def create_outfit_composite(items):
-    """Create a basic composite of outfit items"""
+    """Create a basic composite of outfit items on mannequin"""
     width, height = 800, 1200
+    
+    # White background
     composite = Image.new('RGBA', (width, height), (255, 255, 255, 255))
     
+    # Layer positions for different clothing types
     positions = {
         'shirt': (width//2, height//3),
+        'top': (width//2, height//3),
+        't-shirt': (width//2, height//3),
+        'blouse': (width//2, height//3),
+        'sweater': (width//2, height//3),
+        
         'pants': (width//2, height//2 + 100),
+        'bottom': (width//2, height//2 + 100),
+        'jeans': (width//2, height//2 + 100),
+        'trousers': (width//2, height//2 + 100),
+        'skirt': (width//2, height//2 + 100),
+        
         'shoes': (width//2, height - 200),
+        'shoe': (width//2, height - 200),
+        'sneakers': (width//2, height - 200),
+        'boots': (width//2, height - 200),
+        
         'jacket': (width//2, height//3 - 50),
+        'coat': (width//2, height//3 - 50),
+        
         'dress': (width//2, height//2),
     }
     
     for item in items:
         try:
             image_data = item.get('image', '')
+            if not image_data:
+                print(f"⚠️ No image data for item")
+                continue
+                
+            # Decode base64 image
             if image_data.startswith('data:image'):
                 image_data = image_data.split(',')[1]
             
             img_bytes = base64.b64decode(image_data)
             img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
+            
+            # Resize to fit (preserve aspect ratio)
             img.thumbnail((400, 400), Image.Resampling.LANCZOS)
             
-            category = item.get('category', 'shirt').lower()
+            # Get position based on category
+            category = item.get('category', 'shirt').lower().strip()
             pos = positions.get(category, (width//2, height//2))
+            
+            # Center the image at the position
             paste_pos = (pos[0] - img.width//2, pos[1] - img.height//2)
             
+            # Paste onto composite with transparency
             composite.paste(img, paste_pos, img)
+            print(f"✅ Added {category} to mannequin")
             
         except Exception as e:
-            print(f"Error compositing item: {e}")
+            print(f"⚠️ Error compositing item: {e}")
             continue
     
     return composite
