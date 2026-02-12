@@ -8,6 +8,7 @@ from PIL import Image
 import io
 import base64
 import json
+import time
 
 app = FastAPI()
 
@@ -24,19 +25,22 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 REMOVEBG_API_KEY = os.getenv("REMOVEBG_API_KEY")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 
-# Set Replicate token
 if REPLICATE_API_TOKEN:
     os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-try:
-    import replicate
-    REPLICATE_AVAILABLE = True
-    print("✅ Replicate available!")
-except ImportError:
-    REPLICATE_AVAILABLE = False
-    print("⚠️ Replicate not available")
+# Import replicate
+REPLICATE_AVAILABLE = False
+if REPLICATE_API_TOKEN:
+    try:
+        import replicate
+        REPLICATE_AVAILABLE = True
+        print("✅ Replicate loaded successfully!")
+    except ImportError:
+        print("⚠️ Replicate not installed - run: pip install replicate")
+else:
+    print("⚠️ No REPLICATE_API_TOKEN found")
 
 @app.get("/")
 def read_root():
@@ -46,21 +50,17 @@ def read_root():
         "features": {
             "claude_ai": bool(ANTHROPIC_API_KEY),
             "removebg": bool(REMOVEBG_API_KEY),
-            "replicate": REPLICATE_AVAILABLE and bool(REPLICATE_API_TOKEN)
+            "replicate": REPLICATE_AVAILABLE
         }
     }
 
 @app.post("/analyze-clothing")
 async def analyze_clothing(file: UploadFile = File(...)):
-    """Analyze clothing with Claude Vision"""
     try:
         if not client:
             return JSONResponse(content={
-                "category": "top",
-                "color": "blue",
-                "style": "casual",
-                "season": "all-season",
-                "description": "Clothing item"
+                "category": "top", "color": "blue", "style": "casual",
+                "season": "all-season", "description": "Clothing item"
             })
         
         contents = await file.read()
@@ -70,32 +70,13 @@ async def analyze_clothing(file: UploadFile = File(...)):
         message = client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=512,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": base64_image,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": """Analyze this clothing. Return ONLY valid JSON:
-{
-  "category": "shirt/pants/shoes/jacket/dress/skirt",
-  "color": "main color",
-  "style": "casual/formal/sporty",
-  "season": "spring/summer/fall/winter/all-season",
-  "description": "brief description"
-}"""
-                        }
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64_image}},
+                    {"type": "text", "text": 'Analyze clothing. Return JSON: {"category": "shirt/pants/shoes/jacket", "color": "color", "style": "casual/formal", "season": "spring/summer/fall/winter", "description": "text"}'}
+                ],
+            }],
         )
         
         response_text = message.content[0].text.strip()
@@ -105,38 +86,21 @@ async def analyze_clothing(file: UploadFile = File(...)):
             response_text = response_text.split("```")[1].split("```")[0].strip()
         
         result = json.loads(response_text)
-        print(f"✅ Analysis: {result}")
         return JSONResponse(content=result)
-        
     except Exception as e:
-        print(f"❌ Analysis error: {str(e)}")
-        return JSONResponse(content={
-            "category": "top",
-            "color": "unknown",
-            "style": "casual",
-            "season": "all-season",
-            "description": "Clothing item"
-        })
+        print(f"❌ Analysis error: {e}")
+        return JSONResponse(content={"category": "top", "color": "unknown", "style": "casual", "season": "all-season", "description": ""})
 
 @app.post("/generate-outfit")
 async def generate_outfit(request: dict):
-    """Generate outfit - ALWAYS 3+ items"""
     try:
         wardrobe = request.get("wardrobe", [])
-        occasion = request.get("occasion", "casual")
-        weather = request.get("weather", "moderate")
         
-        if not wardrobe or len(wardrobe) < 2:
-            return JSONResponse(content={
-                "outfit": [{"item_index": 0}],
-                "explanation": "Add more items!"
-            })
+        if len(wardrobe) < 2:
+            return JSONResponse(content={"outfit": [{"item_index": 0}], "explanation": "Add more items!"})
         
-        # Categorize
-        tops = []
-        bottoms = []
-        shoes = []
-        others = []
+        # Categorize wardrobe
+        tops, bottoms, shoes, others = [], [], [], []
         
         for i, item in enumerate(wardrobe):
             cat = item.get('category', '').lower()
@@ -149,51 +113,37 @@ async def generate_outfit(request: dict):
             else:
                 others.append(i)
         
-        print(f"📊 {len(tops)} tops, {len(bottoms)} bottoms, {len(shoes)} shoes")
+        print(f"📊 Wardrobe: {len(tops)} tops, {len(bottoms)} bottoms, {len(shoes)} shoes, {len(others)} other")
         
+        # Build outfit (one from each category)
         outfit_indices = []
-        if tops:
-            outfit_indices.append({"item_index": tops[0]})
-        if bottoms:
-            outfit_indices.append({"item_index": bottoms[0]})
-        if shoes:
-            outfit_indices.append({"item_index": shoes[0]})
+        if tops: outfit_indices.append({"item_index": tops[0]})
+        if bottoms: outfit_indices.append({"item_index": bottoms[0]})
+        if shoes: outfit_indices.append({"item_index": shoes[0]})
         
-        while len(outfit_indices) < 3 and others:
+        # Fill to at least 2 items
+        while len(outfit_indices) < 2 and others:
             outfit_indices.append({"item_index": others.pop(0)})
+        if len(outfit_indices) == 0:
+            outfit_indices = [{"item_index": 0}]
         
-        while len(outfit_indices) < 2:
-            outfit_indices.append({"item_index": 0})
-        
-        print(f"✅ Outfit: {[x['item_index'] for x in outfit_indices]}")
-        
-        explanation = f"Complete outfit for {occasion} in {weather} weather"
+        print(f"✅ Generated outfit: {[x['item_index'] for x in outfit_indices]}")
         
         return JSONResponse(content={
             "outfit": outfit_indices,
-            "explanation": explanation
+            "explanation": f"Complete outfit for {request.get('occasion', 'casual')}"
         })
-        
     except Exception as e:
-        print(f"❌ Outfit error: {str(e)}")
-        return JSONResponse(content={
-            "outfit": [{"item_index": 0}, {"item_index": 1}],
-            "explanation": "Outfit suggestion"
-        })
+        print(f"❌ Outfit error: {e}")
+        return JSONResponse(content={"outfit": [{"item_index": 0}], "explanation": "Error"})
 
 @app.post("/remove-background")
 async def remove_background(file: UploadFile = File(...)):
-    """Remove background with Remove.bg"""
     try:
         contents = await file.read()
         
         if not REMOVEBG_API_KEY:
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "error": "No API key"}
-            )
-        
-        print(f"📤 Remove.bg ({len(contents)} bytes)")
+            return JSONResponse(status_code=400, content={"success": False, "error": "No API key"})
         
         response = requests.post(
             'https://api.remove.bg/v1.0/removebg',
@@ -205,148 +155,153 @@ async def remove_background(file: UploadFile = File(...)):
         
         if response.status_code == 200:
             result_base64 = base64.b64encode(response.content).decode('utf-8')
-            print("✅ BG removed!")
-            return JSONResponse(content={
-                "success": True,
-                "image": f"data:image/png;base64,{result_base64}",
-                "method": "removebg"
-            })
+            return JSONResponse(content={"success": True, "image": f"data:image/png;base64,{result_base64}", "method": "removebg"})
         else:
-            return JSONResponse(
-                status_code=response.status_code,
-                content={"success": False, "error": response.text}
-            )
-        
+            return JSONResponse(status_code=response.status_code, content={"success": False, "error": response.text})
     except Exception as e:
-        print(f"❌ BG error: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
 @app.post("/generate-mannequin")
 async def generate_mannequin(request: dict):
-    """Generate PHOTOREALISTIC mannequin with Replicate"""
+    """Generate mannequin - REALISTIC uses Replicate AI!"""
     try:
         outfit_items = request.get("items", [])
-        style = request.get("style", "realistic")
+        style = request.get("style", "minimal")  # realistic, minimal, artistic
         
         if not outfit_items:
             raise HTTPException(status_code=400, detail="No items")
         
-        print(f"🎨 Creating mannequin: {len(outfit_items)} items, style={style}")
+        print(f"🎨 Mannequin request: {len(outfit_items)} items, style={style}")
         
-        # Step 1: Create basic composite
+        # Create composite
         composite = create_mannequin_composite(outfit_items)
-        
         buffered = io.BytesIO()
         composite.save(buffered, format="PNG")
         composite_bytes = buffered.getvalue()
         composite_base64 = base64.b64encode(composite_bytes).decode('utf-8')
         
-        # Step 2: ENHANCE with Replicate AI
-        if REPLICATE_AVAILABLE and REPLICATE_API_TOKEN:
-            try:
-                print("🤖 Enhancing with Replicate AI...")
-                
-                # Upload composite to a temporary URL or use data URI
-                input_image = f"data:image/png;base64,{composite_base64}"
-                
-                # Use Stable Diffusion XL for img2img
-                output = replicate.run(
-                    "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
-                    input={
-                        "image": input_image,
-                        "prompt": "professional fashion photography, photorealistic male mannequin wearing complete stylish outfit with shirt, pants and shoes, clean white studio background, studio lighting, high quality, 4k, ultra detailed, fashion catalog",
-                        "negative_prompt": "deformed, distorted, disfigured, poor quality, blurry, text, watermark, low quality, bad anatomy, extra limbs, missing clothes, incomplete outfit",
-                        "num_inference_steps": 40,
-                        "guidance_scale": 8.0,
-                        "strength": 0.65,  # How much to transform
-                        "seed": -1,
-                    }
-                )
-                
-                print(f"📥 Replicate output type: {type(output)}")
-                
-                # Get result
-                if isinstance(output, list) and len(output) > 0:
-                    result_url = output[0]
-                elif isinstance(output, str):
-                    result_url = output
-                else:
-                    result_url = str(output)
-                
-                print(f"📥 Downloading from: {result_url[:100]}...")
-                
-                # Download result
-                result_response = requests.get(result_url, timeout=30)
-                result_base64 = base64.b64encode(result_response.content).decode('utf-8')
-                
-                print("✅ Replicate enhanced mannequin created!")
-                
-                return JSONResponse(content={
-                    "success": True,
-                    "image": f"data:image/png;base64,{result_base64}",
-                    "method": "replicate-enhanced"
-                })
-                
-            except Exception as e:
-                print(f"⚠️ Replicate failed: {str(e)}")
-                print(f"⚠️ Falling back to basic composite")
+        # MINIMAL = Just return composite
+        if style == "minimal":
+            print("📦 Returning minimal composite")
+            return JSONResponse(content={
+                "success": True,
+                "image": f"data:image/png;base64,{composite_base64}",
+                "method": "minimal"
+            })
         
-        # Fallback: Basic composite
-        print("📦 Returning basic composite (Replicate not available)")
-        return JSONResponse(content={
-            "success": True,
-            "image": f"data:image/png;base64,{composite_base64}",
-            "method": "basic-composite"
-        })
+        # REALISTIC or ARTISTIC = Use Replicate
+        if not REPLICATE_AVAILABLE:
+            print("⚠️ Replicate not available, returning composite")
+            return JSONResponse(content={
+                "success": True,
+                "image": f"data:image/png;base64,{composite_base64}",
+                "method": "basic-composite"
+            })
+        
+        try:
+            print(f"🤖 Enhancing with Replicate ({style})...")
+            
+            # Different prompts for different styles
+            if style == "realistic":
+                prompt = "professional fashion photography, photorealistic male mannequin wearing complete stylish outfit with all clothing items visible, clean white studio background, professional studio lighting, high quality, ultra detailed, 4k, fashion catalog style"
+                negative = "deformed, distorted, disfigured, low quality, blurry, incomplete outfit, missing items, text, watermark"
+                strength = 0.70
+            else:  # artistic
+                prompt = "artistic fashion illustration, stylized mannequin wearing trendy outfit, minimalist aesthetic, clean lines, modern art style, white background"
+                negative = "photorealistic, deformed, distorted, low quality"
+                strength = 0.75
+            
+            # Call Replicate API
+            output = replicate.run(
+                "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
+                input={
+                    "image": f"data:image/png;base64,{composite_base64}",
+                    "prompt": prompt,
+                    "negative_prompt": negative,
+                    "num_inference_steps": 35,
+                    "guidance_scale": 7.5,
+                    "strength": strength,
+                }
+            )
+            
+            print(f"📥 Replicate output received")
+            
+            # Get URL
+            if isinstance(output, list):
+                result_url = output[0]
+            else:
+                result_url = str(output)
+            
+            print(f"📥 Downloading result...")
+            
+            # Download
+            result_response = requests.get(result_url, timeout=60)
+            result_base64 = base64.b64encode(result_response.content).decode('utf-8')
+            
+            print(f"✅ Replicate {style} mannequin created!")
+            
+            return JSONResponse(content={
+                "success": True,
+                "image": f"data:image/png;base64,{result_base64}",
+                "method": f"replicate-{style}"
+            })
+            
+        except Exception as e:
+            print(f"⚠️ Replicate error: {e}")
+            print(f"⚠️ Falling back to composite")
+            return JSONResponse(content={
+                "success": True,
+                "image": f"data:image/png;base64,{composite_base64}",
+                "method": "basic-composite"
+            })
         
     except Exception as e:
-        print(f"❌ Mannequin error: {str(e)}")
+        print(f"❌ Mannequin error: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 def create_mannequin_composite(items):
-    """Create composite with proper layering"""
+    """Create composite with ALL items properly positioned"""
     width, height = 1024, 1536
     composite = Image.new('RGBA', (width, height), (255, 255, 255, 255))
     
+    # Positions (percentage of height)
     positions = {
-        'shirt': (width//2, int(height * 0.30)),
-        'top': (width//2, int(height * 0.30)),
-        't-shirt': (width//2, int(height * 0.30)),
-        'blouse': (width//2, int(height * 0.30)),
-        'sweater': (width//2, int(height * 0.30)),
+        'outerwear': (width//2, int(height * 0.28)),
         'jacket': (width//2, int(height * 0.28)),
         'coat': (width//2, int(height * 0.28)),
-        'outerwear': (width//2, int(height * 0.28)),
+        'shirt': (width//2, int(height * 0.32)),
+        'top': (width//2, int(height * 0.32)),
+        't-shirt': (width//2, int(height * 0.32)),
+        'blouse': (width//2, int(height * 0.32)),
+        'sweater': (width//2, int(height * 0.30)),
         
-        'pants': (width//2, int(height * 0.55)),
-        'bottom': (width//2, int(height * 0.55)),
-        'jeans': (width//2, int(height * 0.55)),
-        'trousers': (width//2, int(height * 0.55)),
-        'skirt': (width//2, int(height * 0.55)),
+        'pants': (width//2, int(height * 0.58)),
+        'bottom': (width//2, int(height * 0.58)),
+        'jeans': (width//2, int(height * 0.58)),
+        'trousers': (width//2, int(height * 0.58)),
+        'skirt': (width//2, int(height * 0.58)),
         
-        'shoes': (width//2, int(height * 0.82)),
-        'shoe': (width//2, int(height * 0.82)),
-        'sneakers': (width//2, int(height * 0.82)),
-        'boots': (width//2, int(height * 0.82)),
+        'shoes': (width//2, int(height * 0.85)),
+        'shoe': (width//2, int(height * 0.85)),
+        'sneakers': (width//2, int(height * 0.85)),
+        'boots': (width//2, int(height * 0.85)),
+        'sandals': (width//2, int(height * 0.85)),
         
         'dress': (width//2, int(height * 0.45)),
     }
     
-    size_limits = {
-        'jacket': (550, 550),
-        'coat': (550, 550),
-        'outerwear': (550, 550),
+    # Sizes
+    sizes = {
+        'outerwear': (580, 600),
+        'jacket': (550, 580),
         'shirt': (500, 500),
         'top': (500, 500),
-        'pants': (450, 650),
-        'bottom': (450, 650),
-        'shoes': (320, 280),
-        'dress': (500, 700),
+        'pants': (480, 700),
+        'bottom': (480, 700),
+        'shoes': (350, 300),
+        'dress': (520, 750),
     }
     
     for item in items:
@@ -362,7 +317,7 @@ def create_mannequin_composite(items):
             img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
             
             category = item.get('category', 'shirt').lower().strip()
-            max_size = size_limits.get(category, (400, 400))
+            max_size = sizes.get(category, (400, 400))
             
             img.thumbnail(max_size, Image.Resampling.LANCZOS)
             
@@ -370,11 +325,10 @@ def create_mannequin_composite(items):
             paste_pos = (pos[0] - img.width//2, pos[1] - img.height//2)
             
             composite.paste(img, paste_pos, img)
-            print(f"✅ Added {category} at {paste_pos}")
+            print(f"✅ Layered {category}")
             
         except Exception as e:
-            print(f"⚠️ Error adding item: {e}")
-            continue
+            print(f"⚠️ Item error: {e}")
     
     return composite
 
