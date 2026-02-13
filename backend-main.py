@@ -27,7 +27,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY els
 async def root():
     return {
         "status": "live",
-        "service": "the-wardrobe",
+        "service": "stylenigma",
         "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit"],
         "rembg": True,
         "claude": bool(ANTHROPIC_API_KEY),
@@ -156,7 +156,7 @@ async def generate_outfit(request: dict):
                 max_tokens=200,
                 messages=[{
                     "role": "user",
-                    "content": f"""You are a fashion stylist for a wardrobe app called "THE WARDROBE". 
+                    "content": f"""You are a fashion stylist for a wardrobe app called "StyleNigma". 
 For this outfit: {items_desc}. Occasion: {occasion}. Weather: {weather}. 
 Give one styling tip and one explanation of why this works. Be specific about colors and pieces.
 Return JSON: {{"tip": "...", "explanation": "..."}}""",
@@ -182,4 +182,3 @@ Return JSON: {{"tip": "...", "explanation": "..."}}""",
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
