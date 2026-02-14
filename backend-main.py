@@ -27,7 +27,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY els
 async def root():
     return {
         "status": "live",
-        "service": "stylenigma",
+        "service": "styligma",
         "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit"],
         "rembg": True,
         "claude": bool(ANTHROPIC_API_KEY),
@@ -40,20 +40,16 @@ async def remove_background(file: UploadFile = File(...)):
         input_data = await file.read()
         output_data = remove(input_data)
 
-        # Boost color saturation for more vivid images
+        # Boost color saturation for vivid images
         img = Image.open(io.BytesIO(output_data)).convert("RGBA")
-        
-        # Separate alpha channel
         r, g, b, a = img.split()
         rgb_img = Image.merge("RGB", (r, g, b))
-        
-        # Boost saturation by 1.3x and contrast by 1.1x
+
         enhancer = ImageEnhance.Color(rgb_img)
         rgb_img = enhancer.enhance(1.3)
         enhancer = ImageEnhance.Contrast(rgb_img)
         rgb_img = enhancer.enhance(1.1)
-        
-        # Merge alpha back
+
         r2, g2, b2 = rgb_img.split()
         img = Image.merge("RGBA", (r2, g2, b2, a))
 
@@ -132,25 +128,33 @@ async def generate_outfit(request: dict):
     wardrobe = request.get("wardrobe", [])
     occasion = request.get("occasion", "casual")
     weather = request.get("weather", "moderate")
+    previous_outfits = request.get("previous_outfits", [])
 
     if len(wardrobe) < 2:
         return {
             "outfit": [],
-            "explanation": "Add more items to your wardrobe! You need at least one top and one bottom.",
+            "explanation": "Add more items! You need at least one top and one bottom.",
             "styling_tip": "",
         }
 
-    # Build a numbered list of all items for Claude
+    # Build numbered item list for Claude
     items_list = []
     for i, item in enumerate(wardrobe):
         items_list.append(
-            f"[{i}] {item.get('name', 'Item')} - Category: {item.get('category', '?')}, "
+            f"[{i}] {item.get('name', 'Item')} — {item.get('category', '?')}, "
             f"Color: {item.get('color', '?')}, Style: {item.get('style', '?')}, "
-            f"Subcategory: {item.get('subcategory', '?')}"
+            f"Sub: {item.get('subcategory', '?')}"
         )
     items_text = "\n".join(items_list)
 
-    # Let Claude AI pick the best outfit
+    # Format previous outfits so Claude avoids them
+    avoid_text = ""
+    if previous_outfits:
+        avoid_lines = []
+        for prev in previous_outfits[-5:]:  # Only last 5 to save tokens
+            avoid_lines.append(str(prev))
+        avoid_text = f"\n\nAVOID these combinations (already shown):\n" + "\n".join(avoid_lines)
+
     if client:
         try:
             pick_response = client.messages.create(
@@ -158,34 +162,35 @@ async def generate_outfit(request: dict):
                 max_tokens=500,
                 messages=[{
                     "role": "user",
-                    "content": f"""You are an expert fashion stylist for the app "StyleNigma". 
-                    
-Here is the user's wardrobe:
+                    "content": f"""You are an expert fashion stylist for "Styligma ✧".
+
+WARDROBE:
 {items_text}
+{avoid_text}
 
 Pick the BEST outfit for:
 - Occasion: {occasion}
 - Weather: {weather}
 
 RULES:
-- You MUST pick exactly 1 top and 1 bottom
+- MUST pick 1 top + 1 bottom (required)
 - Pick shoes if available
-- Pick 1 accessory/jewelry/bag if it complements the look
-- If weather is cold, pick outerwear if available
-- Focus on COLOR HARMONY: complementary colors, analogous palettes, or elegant monochrome
-- Consider the STYLE matching: don't mix sporty with elegant unless intentional streetwear
-- Think about fabric/texture combinations
-- Be creative but fashionable — surprise the user with combinations they wouldn't think of
+- Pick 1 bag/jewelry/accessory if it complements the look
+- If cold weather, add outerwear
+- DO NOT repeat previous combinations — pick DIFFERENT items
+- Focus on COLOR HARMONY: complementary, analogous, or monochrome palettes
+- Match STYLE: don't mix sporty with elegant unless streetwear
+- Consider fabric/texture combos
+- Be creative — surprise with unexpected but fashionable pairings
 
-Return ONLY this JSON:
+Return ONLY JSON:
 {{
   "selected_indices": [0, 3, 5],
-  "explanation": "One sentence why these pieces work together — mention specific colors and textures",
-  "styling_tip": "One specific actionable styling tip for wearing this outfit"
+  "explanation": "Why these pieces work — mention specific colors and textures",
+  "styling_tip": "One specific actionable tip for wearing this outfit"
 }}
 
-The selected_indices must be the exact index numbers from the wardrobe list above.
-Return ONLY the JSON, no other text.""",
+selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""",
                 }],
             )
 
@@ -196,8 +201,6 @@ Return ONLY the JSON, no other text.""",
 
             pick_data = json.loads(pick_text)
             indices = pick_data.get("selected_indices", [])
-
-            # Validate indices
             valid_indices = [i for i in indices if 0 <= i < len(wardrobe)]
 
             if valid_indices:
@@ -208,20 +211,15 @@ Return ONLY the JSON, no other text.""",
                 }
         except Exception as e:
             print(f"AI outfit selection failed: {e}")
-            # Fall through to random fallback
 
-    # Fallback: random selection if Claude fails
+    # Fallback random
     tops = [i for i, item in enumerate(wardrobe) if item.get("category") == "top"]
     bottoms = [i for i, item in enumerate(wardrobe) if item.get("category") == "bottom"]
     shoes = [i for i, item in enumerate(wardrobe) if item.get("category") == "shoes"]
     outerwear = [i for i, item in enumerate(wardrobe) if item.get("category") == "outerwear"]
 
     if not tops or not bottoms:
-        return {
-            "outfit": [],
-            "explanation": "Add at least one top and one bottom to generate outfits.",
-            "styling_tip": "",
-        }
+        return {"outfit": [], "explanation": "Need at least one top and one bottom.", "styling_tip": ""}
 
     for lst in [tops, bottoms, shoes, outerwear]:
         random.shuffle(lst)
@@ -234,12 +232,11 @@ Return ONLY the JSON, no other text.""",
 
     return {
         "outfit": selected,
-        "explanation": "A curated combination from your wardrobe.",
-        "styling_tip": "Mix textures and proportions for a balanced silhouette.",
+        "explanation": "A fresh combination from your wardrobe.",
+        "styling_tip": "Mix textures for a balanced silhouette.",
     }
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
