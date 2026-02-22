@@ -28,7 +28,7 @@ async def root():
     return {
         "status": "live",
         "service": "styligma",
-        "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit"],
+        "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item"],
         "rembg": True,
         "claude": bool(ANTHROPIC_API_KEY),
     }
@@ -129,6 +129,7 @@ async def generate_outfit(request: dict):
     occasion = request.get("occasion", "casual")
     weather = request.get("weather", "moderate")
     previous_outfits = request.get("previous_outfits", [])
+    style_profile = request.get("style_profile", None)
 
     if len(wardrobe) < 2:
         return {
@@ -155,6 +156,23 @@ async def generate_outfit(request: dict):
             avoid_lines.append(str(prev))
         avoid_text = f"\n\nAVOID these combinations (already shown):\n" + "\n".join(avoid_lines)
 
+    # Style profile personalization
+    profile_text = ""
+    if style_profile:
+        parts = []
+        if style_profile.get("vibe"):
+            parts.append(f"Style vibe: {style_profile['vibe']}")
+        if style_profile.get("colors"):
+            parts.append(f"Preferred colors: {', '.join(style_profile['colors'])}")
+        if style_profile.get("avoid"):
+            avoid_colors = [c for c in style_profile['avoid'] if c != 'none']
+            if avoid_colors:
+                parts.append(f"Colors to AVOID: {', '.join(avoid_colors)}")
+        if style_profile.get("bodyFocus"):
+            parts.append(f"Body focus: {style_profile['bodyFocus']}")
+        if parts:
+            profile_text = "\n\nUSER STYLE PROFILE (personalize to match):\n" + "\n".join(f"- {p}" for p in parts)
+
     if client:
         try:
             pick_response = client.messages.create(
@@ -167,6 +185,7 @@ async def generate_outfit(request: dict):
 WARDROBE:
 {items_text}
 {avoid_text}
+{profile_text}
 
 Pick the BEST outfit for:
 - Occasion: {occasion}
@@ -176,8 +195,18 @@ RULES:
 - MUST pick 1 top + 1 bottom (required)
 - Pick shoes if available
 - Pick 1 bag/jewelry/accessory if it complements the look
-- If cold weather, add outerwear
-- DO NOT repeat previous combinations — pick DIFFERENT items
+
+WEATHER RULES (CRITICAL — follow strictly):
+- If weather is "cold": You MUST include outerwear (jacket/coat/hoodie). An outfit without outerwear in cold weather is INCOMPLETE. If the wardrobe has multiple outerwear items, vary your pick.
+- If weather is "moderate": Outerwear is optional — a light layer can work but isn't required.
+- If weather is "hot": Do NOT include outerwear. Pick lightweight, breathable items. Prefer short sleeves, linen, cotton.
+
+VARIETY RULES:
+- DO NOT repeat previous combinations — pick DIFFERENT items each time
+- If you've used the same outerwear before, pick a different one
+- Rotate through available items — don't always default to the same jacket
+
+STYLE RULES:
 - Focus on COLOR HARMONY: complementary, analogous, or monochrome palettes
 - Match STYLE: don't mix sporty with elegant unless streetwear
 - Consider fabric/texture combos
@@ -227,13 +256,134 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
     selected = [{"item_index": tops[0]}, {"item_index": bottoms[0]}]
     if shoes:
         selected.append({"item_index": shoes[0]})
-    if outerwear and weather == "cold":
+    if outerwear and weather in ["cold", "moderate"]:
         selected.append({"item_index": outerwear[0]})
 
     return {
         "outfit": selected,
         "explanation": "A fresh combination from your wardrobe.",
         "styling_tip": "Mix textures for a balanced silhouette.",
+    }
+
+
+@app.post("/match-item")
+async def match_item(request: dict):
+    """Try Before You Buy: Given a new item's details and the user's wardrobe,
+    find which wardrobe items pair well with it and suggest complete outfits."""
+    new_item = request.get("new_item", {})
+    wardrobe = request.get("wardrobe", [])
+    occasion = request.get("occasion", "casual")
+
+    if not new_item or len(wardrobe) < 1:
+        return {
+            "matches": [],
+            "outfits": [],
+            "verdict": "Add more items to your wardrobe first.",
+            "match_count": 0,
+        }
+
+    # Build wardrobe list
+    items_list = []
+    for i, item in enumerate(wardrobe):
+        items_list.append(
+            f"[{i}] {item.get('name', 'Item')} — {item.get('category', '?')}, "
+            f"Color: {item.get('color', '?')}, Style: {item.get('style', '?')}, "
+            f"Sub: {item.get('subcategory', '?')}"
+        )
+    items_text = "\n".join(items_list)
+
+    new_item_desc = (
+        f"{new_item.get('name', 'Item')} — {new_item.get('category', '?')}, "
+        f"Color: {new_item.get('color', '?')}, Style: {new_item.get('style', '?')}, "
+        f"Sub: {new_item.get('subcategory', '?')}"
+    )
+
+    if client:
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=800,
+                messages=[{
+                    "role": "user",
+                    "content": f"""You are an expert fashion stylist for "Styligma ✧".
+
+A user is considering BUYING this new item:
+NEW ITEM: {new_item_desc}
+
+Their current WARDROBE:
+{items_text}
+
+TASK: Determine how well this new item fits into their existing wardrobe.
+
+1. Find ALL wardrobe items that would pair well with this new item
+2. Suggest up to 3 complete outfits using the new item + wardrobe items
+3. Give a verdict: is this a SMART BUY or redundant?
+
+Return ONLY JSON:
+{{
+  "match_count": <number of items that pair well>,
+  "matching_indices": [list of wardrobe indices that pair with the new item],
+  "outfits": [
+    {{
+      "wardrobe_indices": [indices from wardrobe to combine with new item],
+      "description": "Short outfit description"
+    }}
+  ],
+  "verdict": "SMART BUY: <reason>" or "SKIP: <reason>" or "MAYBE: <reason>",
+  "color_harmony": "Brief note on how the new item's color works with wardrobe",
+  "style_fit": "How well it matches the user's overall style"
+}}
+
+Be honest — if the user already has something similar, say SKIP. If it fills a gap, say SMART BUY.
+ONLY JSON, nothing else.""",
+                }],
+            )
+
+            pick_text = response.content[0].text.strip()
+            if pick_text.startswith("```"):
+                pick_text = pick_text.split("\n", 1)[1]
+                pick_text = pick_text.rsplit("```", 1)[0].strip()
+
+            result = json.loads(pick_text)
+
+            # Validate indices
+            valid_matches = [i for i in result.get("matching_indices", []) if 0 <= i < len(wardrobe)]
+            valid_outfits = []
+            for outfit in result.get("outfits", [])[:3]:
+                valid_idx = [i for i in outfit.get("wardrobe_indices", []) if 0 <= i < len(wardrobe)]
+                if valid_idx:
+                    valid_outfits.append({
+                        "wardrobe_indices": valid_idx,
+                        "description": outfit.get("description", ""),
+                    })
+
+            return {
+                "match_count": len(valid_matches),
+                "matching_indices": valid_matches,
+                "outfits": valid_outfits,
+                "verdict": result.get("verdict", "Looks like a versatile addition."),
+                "color_harmony": result.get("color_harmony", ""),
+                "style_fit": result.get("style_fit", ""),
+            }
+        except Exception as e:
+            print(f"Match item failed: {e}")
+
+    # Fallback: simple category matching
+    new_cat = new_item.get("category", "")
+    matches = []
+    for i, item in enumerate(wardrobe):
+        cat = item.get("category", "")
+        # Items that complement (different category = potential pair)
+        if cat != new_cat:
+            matches.append(i)
+
+    return {
+        "match_count": len(matches),
+        "matching_indices": matches[:10],
+        "outfits": [],
+        "verdict": f"This pairs with {len(matches)} items in your wardrobe.",
+        "color_harmony": "",
+        "style_fit": "",
     }
 
 
