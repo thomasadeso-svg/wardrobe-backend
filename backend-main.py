@@ -10,7 +10,7 @@ import json
 import random
 import re
 from PIL import Image, ImageEnhance
-from rembg import remove, new_session
+from rembg import remove
 
 app = FastAPI()
 
@@ -24,8 +24,6 @@ app.add_middleware(
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# PRE-LOAD the lightweight, fast background removal model!
-fast_session = new_session("u2netp")
 
 @app.get("/")
 async def root():
@@ -43,7 +41,7 @@ async def remove_background(file: UploadFile = File(...)):
     try:
         input_data = await file.read()
 
-        # Resize to max 1024px BEFORE rembg (cuts 15s -> 3-5s)
+        # Resize to max 1024px BEFORE rembg (cuts 15s -> 5s, keeps quality)
         img_input = Image.open(io.BytesIO(input_data))
         max_size = 1024
         if max(img_input.size) > max_size:
@@ -52,8 +50,8 @@ async def remove_background(file: UploadFile = File(...)):
             img_input.save(buf_resized, format="PNG")
             input_data = buf_resized.getvalue()
 
-        # USE THE FAST SESSION HERE
-        output_data = remove(input_data, session=fast_session)
+        # Default model = best quality background removal
+        output_data = remove(input_data)
 
         # Boost color saturation for vivid images
         img = Image.open(io.BytesIO(output_data)).convert("RGBA")
@@ -75,7 +73,7 @@ async def remove_background(file: UploadFile = File(...)):
         return {
             "success": True,
             "image": f"data:image/png;base64,{base64_image}",
-            "method": "rembg-local-fast",
+            "method": "rembg-local-free",
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
@@ -88,7 +86,7 @@ async def analyze_clothing(file: UploadFile = File(...)):
         base64_image = base64.b64encode(contents).decode("utf-8")
 
         message = client.messages.create(
-            model="claude-3-7-sonnet-latest",
+            model="claude-sonnet-4-20250514",
             max_tokens=512,
             messages=[{
                 "role": "user",
@@ -134,16 +132,16 @@ Return ONLY the JSON, no other text.""",
         )
 
         response_text = message.content[0].text.strip()
-        
-        # NEW FAIL-PROOF JSON EXTRACTOR
+
+        # Fail-proof JSON extraction
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if not match:
             raise ValueError("Claude didn't return valid JSON")
-            
+
         result = json.loads(match.group(0))
         return JSONResponse(content=result)
     except json.JSONDecodeError:
-        return {"rejected": True, "reason": "Could not analyze this image. Please try again with a clear photo of a clothing item."}
+        return JSONResponse(content={"rejected": True, "reason": "Could not analyze this image. Please try again with a clear photo of a clothing item."})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -177,7 +175,7 @@ async def generate_outfit(request: dict):
     avoid_text = ""
     if previous_outfits:
         avoid_lines = []
-        for prev in previous_outfits[-5:]:  # Only last 5 to save tokens
+        for prev in previous_outfits[-5:]:
             avoid_lines.append(str(prev))
         avoid_text = f"\n\nAVOID these combinations (already shown):\n" + "\n".join(avoid_lines)
 
@@ -201,7 +199,7 @@ async def generate_outfit(request: dict):
     if client:
         try:
             pick_response = client.messages.create(
-                model="claude-3-7-sonnet-latest",
+                model="claude-sonnet-4-20250514",
                 max_tokens=500,
                 messages=[{
                     "role": "user",
@@ -253,30 +251,29 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
             )
 
             pick_text = pick_response.content[0].text.strip()
-            
-            # NEW FAIL-PROOF JSON EXTRACTOR
+
+            # Fail-proof JSON extraction
             match = re.search(r'\{.*\}', pick_text, re.DOTALL)
             if not match:
                 raise ValueError("Claude didn't return valid JSON")
-                
+
             pick_data = json.loads(match.group(0))
             indices = pick_data.get("selected_indices", [])
             valid_indices = [i for i in indices if 0 <= i < len(wardrobe)]
 
-            # NEW: Server-side safety to remove duplicate categories & handle capitalization
+            # Server-side: remove duplicate categories
             seen_categories = set()
             deduplicated = []
-            
             for i in valid_indices:
-                cat = wardrobe[i].get("category", "unknown").lower().strip() 
+                cat = wardrobe[i].get("category", "unknown").lower().strip()
                 if cat not in seen_categories:
                     seen_categories.add(cat)
                     deduplicated.append(i)
-            
-            # NEW: SORT TOP TO BOTTOM
+
+            # Sort top to bottom: outerwear -> top -> bottom -> shoes -> accessories
             category_order = {"outerwear": 0, "top": 1, "bottom": 2, "shoes": 3, "bag": 4, "jewelry": 5, "accessory": 6}
             deduplicated.sort(key=lambda x: category_order.get(wardrobe[x].get("category", "unknown").lower().strip(), 99))
-            
+
             valid_indices = deduplicated
 
             if valid_indices:
@@ -304,7 +301,7 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
     if shoes:
         selected.append({"item_index": shoes[0]})
     if outerwear and weather in ["cold", "moderate"]:
-        selected.insert(0, {"item_index": outerwear[0]}) # Insert outerwear at top
+        selected.insert(0, {"item_index": outerwear[0]})
 
     return {
         "outfit": selected,
@@ -345,7 +342,7 @@ async def match_item(request: dict):
     if client:
         try:
             response = client.messages.create(
-                model="claude-3-7-sonnet-latest",
+                model="claude-sonnet-4-20250514",
                 max_tokens=800,
                 messages=[{
                     "role": "user",
@@ -384,12 +381,11 @@ ONLY JSON, nothing else.""",
             )
 
             pick_text = response.content[0].text.strip()
-            
-            # NEW FAIL-PROOF JSON EXTRACTOR
+
             match = re.search(r'\{.*\}', pick_text, re.DOTALL)
             if not match:
                 raise ValueError("Claude didn't return valid JSON")
-                
+
             result = json.loads(match.group(0))
 
             valid_matches = [i for i in result.get("matching_indices", []) if 0 <= i < len(wardrobe)]
