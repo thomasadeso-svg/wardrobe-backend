@@ -88,7 +88,7 @@ async def analyze_clothing(file: UploadFile = File(...)):
         base64_image = base64.b64encode(contents).decode("utf-8")
 
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-3-7-sonnet-latest",
             max_tokens=512,
             messages=[{
                 "role": "user",
@@ -201,7 +201,7 @@ async def generate_outfit(request: dict):
     if client:
         try:
             pick_response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-3-7-sonnet-latest",
                 max_tokens=500,
                 messages=[{
                     "role": "user",
@@ -345,7 +345,7 @@ async def match_item(request: dict):
     if client:
         try:
             response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-3-7-sonnet-latest",
                 max_tokens=800,
                 messages=[{
                     "role": "user",
