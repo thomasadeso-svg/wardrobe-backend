@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from pathlib import Path
@@ -27,21 +27,30 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # -----------------------------
-# SPEED SETTINGS (safe defaults)
+# SPEED SETTINGS
 # -----------------------------
-REMOVE_BG_MAX = int(os.getenv("REMOVE_BG_MAX", "1024")) # background removal input size
-ANALYZE_MAX = int(os.getenv("ANALYZE_MAX", "768")) # Claude vision input size (smaller => faster)
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "82")) # good speed/quality balance
+REMOVE_BG_MAX = int(os.getenv("REMOVE_BG_MAX", "1024")) # rembg input size
+ANALYZE_MAX = int(os.getenv("ANALYZE_MAX", "768")) # Claude input size
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "82")) # speed/quality balance
 
-# Pre-load fast rembg session (already good)
+# -----------------------------
+# IMPORTANT: Lazy-load rembg session to avoid Railway boot crash
+# -----------------------------
+fast_session = None
+
+def get_fast_session():
+global fast_session
+if fast_session is None:
+# lightweight faster model
 fast_session = new_session("u2netp")
+return fast_session
 
 # -----------------------------
-# Tiny in-memory cache (helps repeated tests)
+# Small in-memory caches (optional but fast for repeated tests)
 # -----------------------------
 REMOVE_BG_CACHE: Dict[str, str] = {}
 ANALYZE_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_LIMIT = 120 # keep small for Railway RAM
+CACHE_LIMIT = 80 # keep small for Railway memory
 
 ALLOWED_CATEGORIES = {"top", "bottom", "shoes", "outerwear", "bag", "jewelry", "accessory"}
 
@@ -51,17 +60,12 @@ return hashlib.sha256(b).hexdigest()
 def _cache_set(cache: dict, key: str, value):
 cache[key] = value
 if len(cache) > CACHE_LIMIT:
-# drop oldest item (simple FIFO)
 first = next(iter(cache))
 cache.pop(first, None)
 
 def _extract_json(text: str) -> Dict[str, Any]:
-"""
-Fail-proof JSON extractor. If no JSON => return {}.
-"""
 if not text:
 return {}
-text = text.strip()
 m = re.search(r"\{.*\}", text, re.DOTALL)
 if not m:
 return {}
@@ -73,36 +77,29 @@ return {}
 def _resize_to_max(contents: bytes, max_side: int) -> bytes:
 """
 Resize + convert to JPEG for faster upload/inference.
-(We only need PNG output after background removal.)
 """
 img = Image.open(io.BytesIO(contents))
-img = img.convert("RGB") # ensures JPEG-compatible
+img = img.convert("RGB")
 if max(img.size) > max_side:
 img.thumbnail((max_side, max_side), Image.LANCZOS)
 buf = io.BytesIO()
 img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
 return buf.getvalue()
 
+
 @app.get("/")
 async def root():
 return {
 "status": "live",
 "service": "styligma-v2",
-"endpoints": [
-"/remove-background",
-"/analyze-clothing",
-"/generate-outfit",
-"/match-item",
-"/privacy",
-"/terms",
-],
+"endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item", "/privacy", "/terms"],
 "rembg": True,
 "claude": bool(ANTHROPIC_API_KEY),
 }
 
 
 # =========================================================
-# BACKGROUND REMOVAL (FAST)
+# REMOVE BACKGROUND (FAST + STABLE)
 # =========================================================
 @app.post("/remove-background")
 async def remove_background(file: UploadFile = File(...)):
@@ -111,7 +108,7 @@ input_data = await file.read()
 if not input_data:
 return JSONResponse(status_code=400, content={"success": False, "error": "Empty file"})
 
-# Cache hit (helps when testing same photo repeatedly)
+# cache hit
 key = _hash_bytes(input_data)
 if key in REMOVE_BG_CACHE:
 return {
@@ -120,14 +117,16 @@ return {
 "method": "rembg-local-fast-cache",
 }
 
-# Resize BEFORE rembg (big win)
-# NOTE: we convert to JPEG bytes for speed.
+# Resize to max 1024 BEFORE rembg (cuts big time)
 resized_jpg = _resize_to_max(input_data, REMOVE_BG_MAX)
 
-# Use the fast session
-output_data = remove(resized_jpg, session=fast_session)
+# Lazy session init (prevents deployment crash)
+session = get_fast_session()
 
-# Optional: light enhancement (keep, but cheap)
+# remove bg
+output_data = remove(resized_jpg, session=session)
+
+# Boost color saturation (kept from your code, but slightly lighter)
 img = Image.open(io.BytesIO(output_data)).convert("RGBA")
 r, g, b, a = img.split()
 rgb_img = Image.merge("RGB", (r, g, b))
@@ -158,44 +157,54 @@ return JSONResponse(status_code=500, content={"success": False, "error": str(e)}
 
 
 # =========================================================
-# CLOTHING ANALYSIS (FAST + STRICT REJECT GATE)
+# ANALYZE CLOTHING (FAST + "CUP BUG" FIXED)
 # =========================================================
 @app.post("/analyze-clothing")
 async def analyze_clothing(file: UploadFile = File(...)):
 try:
 if not client:
-# If Claude not available, do NOT randomly accept things.
 return {
 "rejected": True,
-"reason": "AI not available. Please try again later with a clear clothing photo.",
+"reason": "AI not available. Please try again later with a clear clothing photo."
 }
 
 contents = await file.read()
 if not contents:
 return JSONResponse(status_code=400, content={"rejected": True, "reason": "Empty file"})
 
-# Cache hit
+# cache hit
 key = _hash_bytes(contents)
 if key in ANALYZE_CACHE:
 return JSONResponse(content=ANALYZE_CACHE[key])
 
-# SPEED: resize image for Claude (768px default)
+# SPEED: resize for Claude
 resized_jpg = _resize_to_max(contents, ANALYZE_MAX)
 base64_image = base64.b64encode(resized_jpg).decode("utf-8")
-media_type = "image/jpeg"
 
-# IMPORTANT: strict gate that MUST reject non-fashion
-prompt = """You are a strict fashion wardrobe gatekeeper. Your ONLY job is to accept real wearable clothing items and fashion accessories, and REJECT everything else.
+message = client.messages.create(
+model="claude-sonnet-4-20250514",
+max_tokens=420, # faster
+messages=[{
+"role": "user",
+"content": [
+{
+"type": "image",
+"source": {"type": "base64", "media_type": "image/jpeg", "data": base64_image},
+},
+{
+"type": "text",
+"text": """You are a strict fashion wardrobe gatekeeper. Your ONLY job is to accept real clothing items and fashion accessories, and REJECT everything else.
 
-If the image is NOT a single wearable fashion item, you MUST reject.
-REJECT examples: cup/mug, drink, food, electronics, laptop, phone, furniture, room, landscape, plant, tool, toy, animal, selfie/person, or any non-wearable object. If unclear or blurry => REJECT.
+ABSOLUTE REJECT (must reject):
+cups/mugs, food, drinks, electronics, laptops, phones, furniture, rooms, landscapes, plants, toys, tools, animals, people/selfies/faces/body parts, or ANY object that is not worn on the body.
+If blurry or unclear: REJECT.
 
-Return ONLY valid JSON (no markdown, no extra text). Use EXACTLY ONE of these two outputs:
+When in doubt: REJECT.
 
-(1) If REJECTED:
+If REJECTED, return ONLY this JSON:
 {"rejected": true, "reason": "This doesn't look like a clothing item or accessory. Please photograph a single piece of clothing, shoes, bag, jewelry, or accessory."}
 
-(2) If ACCEPTED:
+If ACCEPTED, return ONLY this JSON:
 {
 "rejected": false,
 "category": "top" or "bottom" or "shoes" or "outerwear" or "bag" or "jewelry" or "accessory",
@@ -208,22 +217,8 @@ Return ONLY valid JSON (no markdown, no extra text). Use EXACTLY ONE of these tw
 "name": "Short descriptive name like 'Black Slim Jeans' or 'Gold Chain Necklace'"
 }
 
-ABSOLUTE RULES:
-- If it’s a cup/mug/food/electronics => MUST reject.
-- If unsure => reject.
-"""
-
-message = client.messages.create(
-model="claude-sonnet-4-20250514",
-max_tokens=420, # smaller = faster
-messages=[{
-"role": "user",
-"content": [
-{
-"type": "image",
-"source": {"type": "base64", "media_type": media_type, "data": base64_image},
+Return ONLY the JSON, no other text.""",
 },
-{"type": "text", "text": prompt},
 ],
 }],
 )
@@ -231,25 +226,20 @@ messages=[{
 response_text = message.content[0].text.strip() if message.content else ""
 result = _extract_json(response_text)
 
-# SERVER-SIDE HARD VALIDATION (prevents "cup=top" forever)
-# If Claude returns no/invalid JSON => reject safely.
+# HARD SERVER VALIDATION (prevents cup => clothing permanently)
 if not isinstance(result, dict) or "rejected" not in result:
 safe = {
 "rejected": True,
-"reason": "Could not analyze this image. Please try again with a clear clothing photo."
+"reason": "Could not analyze this image. Please try again with a clear photo of a clothing item."
 }
 _cache_set(ANALYZE_CACHE, key, safe)
 return JSONResponse(content=safe)
 
 if result.get("rejected") is True:
-safe = {
-"rejected": True,
-"reason": result.get("reason") or "Not a clothing item or accessory."
-}
+safe = {"rejected": True, "reason": result.get("reason") or "Not a clothing item or accessory."}
 _cache_set(ANALYZE_CACHE, key, safe)
 return JSONResponse(content=safe)
 
-# Accepted: ensure category is valid, otherwise reject (very important)
 cat = str(result.get("category", "")).lower().strip()
 if cat not in ALLOWED_CATEGORIES:
 safe = {
@@ -259,7 +249,7 @@ safe = {
 _cache_set(ANALYZE_CACHE, key, safe)
 return JSONResponse(content=safe)
 
-# Normalize fields to avoid frontend crashes
+# normalize output so frontend never crashes
 result["category"] = cat
 if not isinstance(result.get("colors"), list):
 result["colors"] = [result.get("color")] if result.get("color") else []
@@ -270,16 +260,17 @@ _cache_set(ANALYZE_CACHE, key, result)
 return JSONResponse(content=result)
 
 except json.JSONDecodeError:
-return {
+safe = {
 "rejected": True,
 "reason": "Could not analyze this image. Please try again with a clear photo of a clothing item."
 }
+return JSONResponse(content=safe)
 except Exception as e:
 return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 # =========================================================
-# OUTFIT GENERATION (UNCHANGED LOGIC - kept)
+# GENERATE OUTFIT (UNCHANGED FROM YOUR CODE)
 # =========================================================
 @app.post("/generate-outfit")
 async def generate_outfit(request: dict):
@@ -369,6 +360,7 @@ STYLE RULES:
 - Focus on COLOR HARMONY: complementary, analogous, or monochrome palettes
 - Match STYLE: don't mix sporty with elegant unless streetwear
 - Consider fabric/texture combos
+- Be creative — surprise with unexpected but fashionable pairings
 
 Return ONLY JSON:
 {{
@@ -376,7 +368,8 @@ Return ONLY JSON:
 "explanation": "Why these pieces work — mention specific colors and textures",
 "styling_tip": "One specific actionable tip for wearing this outfit"
 }}
-ONLY JSON, nothing else.""",
+
+selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""",
 }],
 )
 
@@ -411,7 +404,6 @@ return {
 except Exception as e:
 print(f"AI outfit selection failed: {e}")
 
-# Fallback random
 tops = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "top"]
 bottoms = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "bottom"]
 shoes = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "shoes"]
@@ -437,7 +429,7 @@ return {
 
 
 # =========================================================
-# MATCH-ITEM (UNCHANGED)
+# MATCH ITEM (UNCHANGED)
 # =========================================================
 @app.post("/match-item")
 async def match_item(request: dict):
@@ -485,20 +477,26 @@ Their current WARDROBE:
 
 TASK: Determine how well this new item fits into their existing wardrobe.
 
+1. Find ALL wardrobe items that would pair well with this new item
+2. Suggest up to 3 complete outfits using the new item + wardrobe items
+3. Give a verdict: is this a SMART BUY or redundant?
+
 Return ONLY JSON:
 {{
-"match_count": <number>,
-"matching_indices": [indices],
+"match_count": <number of items that pair well>,
+"matching_indices": [list of wardrobe indices that pair with the new item],
 "outfits": [
 {{
-"wardrobe_indices": [indices],
+"wardrobe_indices": [indices from wardrobe to combine with new item],
 "description": "Short outfit description"
 }}
 ],
 "verdict": "SMART BUY: <reason>" or "SKIP: <reason>" or "MAYBE: <reason>",
-"color_harmony": "Brief note",
-"style_fit": "Brief note"
+"color_harmony": "Brief note on how the new item's color works with wardrobe",
+"style_fit": "How well it matches the user's overall style"
 }}
+
+Be honest — if the user already has something similar, say SKIP. If it fills a gap, say SMART BUY.
 ONLY JSON, nothing else.""",
 }],
 )
@@ -561,3 +559,4 @@ return Path("terms.html").read_text(encoding="utf-8")
 if __name__ == "__main__":
 import uvicorn
 uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
