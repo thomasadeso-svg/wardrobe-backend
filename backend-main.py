@@ -1,8 +1,7 @@
-from fastapi.responses import HTMLResponse
-from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from pathlib import Path
 import anthropic
 import os
 import io
@@ -10,7 +9,7 @@ import base64
 import json
 import random
 from PIL import Image, ImageEnhance
-from rembg import remove
+from rembg import remove, new_session
 
 app = FastAPI()
 
@@ -24,13 +23,16 @@ app.add_middleware(
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
+# Pre-load fast rembg model once at startup (not per request)
+rembg_session = new_session("u2netp")
+
 
 @app.get("/")
 async def root():
     return {
         "status": "live",
         "service": "styligma",
-        "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item"],
+        "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item", "/privacy", "/terms"],
         "rembg": True,
         "claude": bool(ANTHROPIC_API_KEY),
     }
@@ -40,7 +42,18 @@ async def root():
 async def remove_background(file: UploadFile = File(...)):
     try:
         input_data = await file.read()
-        output_data = remove(input_data)
+
+        # Resize large images before processing (huge speed boost)
+        img_input = Image.open(io.BytesIO(input_data))
+        max_size = 1024
+        if max(img_input.size) > max_size:
+            img_input.thumbnail((max_size, max_size), Image.LANCZOS)
+            buf_resized = io.BytesIO()
+            img_input.save(buf_resized, format="PNG")
+            input_data = buf_resized.getvalue()
+
+        # Use pre-loaded fast model
+        output_data = remove(input_data, session=rembg_session)
 
         # Boost color saturation for vivid images
         img = Image.open(io.BytesIO(output_data)).convert("RGBA")
@@ -62,7 +75,7 @@ async def remove_background(file: UploadFile = File(...)):
         return {
             "success": True,
             "image": f"data:image/png;base64,{base64_image}",
-            "method": "rembg-local-free",
+            "method": "rembg-fast",
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
@@ -154,7 +167,7 @@ async def generate_outfit(request: dict):
     avoid_text = ""
     if previous_outfits:
         avoid_lines = []
-        for prev in previous_outfits[-5:]:  # Only last 5 to save tokens
+        for prev in previous_outfits[-5:]:
             avoid_lines.append(str(prev))
         avoid_text = f"\n\nAVOID these combinations (already shown):\n" + "\n".join(avoid_lines)
 
@@ -375,7 +388,6 @@ ONLY JSON, nothing else.""",
     matches = []
     for i, item in enumerate(wardrobe):
         cat = item.get("category", "")
-        # Items that complement (different category = potential pair)
         if cat != new_cat:
             matches.append(i)
 
@@ -387,14 +399,19 @@ ONLY JSON, nothing else.""",
         "color_harmony": "",
         "style_fit": "",
     }
+
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     return Path("privacy.html").read_text(encoding="utf-8")
+
 
 @app.get("/terms", response_class=HTMLResponse)
 async def terms():
     return Path("terms.html").read_text(encoding="utf-8")
 
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
