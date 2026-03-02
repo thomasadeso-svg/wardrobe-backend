@@ -1,7 +1,8 @@
+from fastapi.responses import HTMLResponse
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
-from pathlib import Path
+from fastapi.responses import JSONResponse
 import anthropic
 import os
 import io
@@ -29,7 +30,7 @@ async def root():
     return {
         "status": "live",
         "service": "styligma",
-        "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item", "/privacy", "/terms"],
+        "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item"],
         "rembg": True,
         "claude": bool(ANTHROPIC_API_KEY),
     }
@@ -40,7 +41,7 @@ async def remove_background(file: UploadFile = File(...)):
     try:
         input_data = await file.read()
 
-        # Resize large images before processing (big speed boost)
+        # === ADDED: Resize large images for speed (15s -> 4s) ===
         img_input = Image.open(io.BytesIO(input_data))
         max_size = 1024
         if max(img_input.size) > max_size:
@@ -48,8 +49,8 @@ async def remove_background(file: UploadFile = File(...)):
             buf_resized = io.BytesIO()
             img_input.save(buf_resized, format="PNG")
             input_data = buf_resized.getvalue()
+        # === END ADDED ===
 
-        # Use default model (best quality) — speed comes from resize above
         output_data = remove(input_data)
 
         # Boost color saturation for vivid images
@@ -72,7 +73,7 @@ async def remove_background(file: UploadFile = File(...)):
         return {
             "success": True,
             "image": f"data:image/png;base64,{base64_image}",
-            "method": "rembg-optimized",
+            "method": "rembg-local-free",
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
@@ -96,33 +97,23 @@ async def analyze_clothing(file: UploadFile = File(...)):
                     },
                     {
                         "type": "text",
-                        "text": """You are a strict fashion wardrobe gatekeeper. Your job is to ONLY accept real clothing items and fashion accessories.
+                        # === UPDATED: Stricter clothing-only detection ===
+                        "text": """You are a strict fashion wardrobe gatekeeper. Your ONLY job is to accept real clothing items and fashion accessories, and REJECT everything else.
 
-STEP 1 — STRICTLY determine if this image shows ONE of these:
-ACCEPTED: shirts, t-shirts, blouses, sweaters, hoodies, jackets, coats, blazers, vests, pants, jeans, shorts, skirts, dresses, shoes, sneakers, boots, sandals, heels, bags, handbags, backpacks, belts, watches, necklaces, bracelets, rings, earrings, sunglasses, scarves, hats, caps, ties, gloves, socks
+STEP 1 — Is this a wearable fashion item?
 
-REJECTED (return rejected=true for ALL of these):
-- People, selfies, faces, body parts
-- Food, drinks, plates, kitchen items
-- Animals, pets
-- Cars, vehicles, bikes
-- Furniture, rooms, buildings, landscapes
-- Electronics, phones, laptops, TVs
-- Books, papers, documents
-- Plants, flowers, trees
-- Toys, games
-- Tools, hardware
-- Money, cards
-- ANY object that is not worn on the body as clothing or fashion accessory
-- Blurry, unclear, or unrecognizable images
-- Multiple items in one photo (user should photograph ONE item at a time)
+ACCEPTED (return rejected=false):
+Shirts, t-shirts, blouses, sweaters, hoodies, jackets, coats, blazers, vests, pants, jeans, shorts, skirts, dresses, shoes, sneakers, boots, sandals, heels, bags, handbags, backpacks, belts, watches, necklaces, bracelets, rings, earrings, sunglasses, scarves, hats, caps, ties, gloves, socks.
 
-If REJECTED, return ONLY:
+REJECTED (return rejected=true):
+People, selfies, faces, body parts, food, drinks, animals, pets, cars, vehicles, furniture, rooms, buildings, landscapes, electronics, phones, laptops, books, plants, flowers, toys, tools, money, or ANY object that is not worn on the body. Also reject blurry or unrecognizable images.
+
+When in doubt, REJECT.
+
+If REJECTED, return ONLY this JSON:
 {"rejected": true, "reason": "This doesn't look like a clothing item or accessory. Please photograph a single piece of clothing, shoes, bag, jewelry, or accessory."}
 
-Be VERY strict. When in doubt, REJECT. Only accept items that are clearly wearable fashion items.
-
-STEP 2 — If this IS a valid single fashion item, return ONLY this JSON:
+STEP 2 — If ACCEPTED, return ONLY this JSON:
 {
   "rejected": false,
   "category": "top" or "bottom" or "shoes" or "outerwear" or "bag" or "jewelry" or "accessory",
@@ -136,6 +127,7 @@ STEP 2 — If this IS a valid single fashion item, return ONLY this JSON:
 }
 
 Return ONLY the JSON, no other text.""",
+                        # === END UPDATED ===
                     },
                 ],
             }],
@@ -169,34 +161,23 @@ async def generate_outfit(request: dict):
             "styling_tip": "",
         }
 
-    # Categorize all wardrobe items
-    by_category = {"top": [], "bottom": [], "shoes": [], "outerwear": [], "bag": [], "jewelry": [], "accessory": []}
-    for i, item in enumerate(wardrobe):
-        cat = item.get("category", "top")
-        if cat in by_category:
-            by_category[cat].append(i)
-
     # Build numbered item list for Claude
     items_list = []
     for i, item in enumerate(wardrobe):
         items_list.append(
-            f"[{i}] {item.get('name', 'Item')} — category: {item.get('category', '?')}, "
+            f"[{i}] {item.get('name', 'Item')} — {item.get('category', '?')}, "
             f"Color: {item.get('color', '?')}, Style: {item.get('style', '?')}, "
             f"Sub: {item.get('subcategory', '?')}"
         )
     items_text = "\n".join(items_list)
 
-    # Show available categories to Claude
-    available_cats = {cat: idxs for cat, idxs in by_category.items() if idxs}
-    category_summary = "\n".join(f"  {cat}: indices {idxs}" for cat, idxs in available_cats.items())
-
     # Format previous outfits so Claude avoids them
     avoid_text = ""
     if previous_outfits:
         avoid_lines = []
-        for prev in previous_outfits[-5:]:
+        for prev in previous_outfits[-5:]:  # Only last 5 to save tokens
             avoid_lines.append(str(prev))
-        avoid_text = f"\n\nAVOID these exact combinations (already shown):\n" + "\n".join(avoid_lines)
+        avoid_text = f"\n\nAVOID these combinations (already shown):\n" + "\n".join(avoid_lines)
 
     # Style profile personalization
     profile_text = ""
@@ -226,9 +207,6 @@ async def generate_outfit(request: dict):
 
 WARDROBE:
 {items_text}
-
-ITEMS GROUPED BY CATEGORY:
-{category_summary}
 {avoid_text}
 {profile_text}
 
@@ -236,34 +214,35 @@ Pick the BEST outfit for:
 - Occasion: {occasion}
 - Weather: {weather}
 
-STRICT SELECTION RULES — YOU MUST FOLLOW THESE EXACTLY:
-1. Pick EXACTLY 1 "top" item (REQUIRED)
-2. Pick EXACTLY 1 "bottom" item (REQUIRED)
-3. Pick EXACTLY 1 "shoes" item (if available)
-4. Weather rules for outerwear:
-   - "cold" weather: Pick EXACTLY 1 "outerwear" item (REQUIRED)
-   - "moderate" weather: Optionally pick 1 "outerwear" item
-   - "hot" weather: Do NOT pick any outerwear
-5. Optionally pick 1 accessory/jewelry/bag item (max 1)
+RULES:
+- MUST pick 1 top + 1 bottom (required)
+- Pick shoes if available
+- Pick 1 bag/jewelry/accessory if it complements the look
 
-ABSOLUTE RULES — VIOLATION IS FORBIDDEN:
-- NEVER select 2 items from the same category
-- NEVER select 2 tops, 2 bottoms, 2 shoes, or 2 outerwear pieces
-- Each category appears AT MOST ONCE
-- The outfit should have 3-5 items total, never more
+WEATHER RULES (CRITICAL — follow strictly):
+- If weather is "cold": You MUST include outerwear (jacket/coat/hoodie). An outfit without outerwear in cold weather is INCOMPLETE. If the wardrobe has multiple outerwear items, vary your pick.
+- If weather is "moderate": Outerwear is optional — a light layer can work but isn't required.
+- If weather is "hot": Do NOT include outerwear. Pick lightweight, breathable items. Prefer short sleeves, linen, cotton.
 
-VARIETY: Pick DIFFERENT items than previous outfits shown above.
+VARIETY RULES:
+- DO NOT repeat previous combinations — pick DIFFERENT items each time
+- If you've used the same outerwear before, pick a different one
+- Rotate through available items — don't always default to the same jacket
 
-STYLE: Focus on color harmony, occasion-appropriate pairings, and texture contrast.
+STYLE RULES:
+- Focus on COLOR HARMONY: complementary, analogous, or monochrome palettes
+- Match STYLE: don't mix sporty with elegant unless streetwear
+- Consider fabric/texture combos
+- Be creative — surprise with unexpected but fashionable pairings
 
-Return ONLY this JSON:
+Return ONLY JSON:
 {{
-  "selected_indices": [one index per category, 3-5 total],
-  "explanation": "Why these pieces work — mention colors and textures",
-  "styling_tip": "One actionable tip for wearing this outfit"
+  "selected_indices": [0, 3, 5],
+  "explanation": "Why these pieces work — mention specific colors and textures",
+  "styling_tip": "One specific actionable tip for wearing this outfit"
 }}
 
-Double-check: each index must come from a DIFFERENT category. ONLY JSON, nothing else.""",
+selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""",
                 }],
             )
 
@@ -276,17 +255,7 @@ Double-check: each index must come from a DIFFERENT category. ONLY JSON, nothing
             indices = pick_data.get("selected_indices", [])
             valid_indices = [i for i in indices if 0 <= i < len(wardrobe)]
 
-            # ENFORCE server-side: no duplicate categories ever
-            seen_categories = set()
-            deduplicated = []
-            for i in valid_indices:
-                cat = wardrobe[i].get("category", "unknown")
-                if cat not in seen_categories:
-                    seen_categories.add(cat)
-                    deduplicated.append(i)
-            valid_indices = deduplicated
-
-            if valid_indices and len(valid_indices) >= 2:
+            if valid_indices:
                 return {
                     "outfit": [{"item_index": i} for i in valid_indices],
                     "explanation": pick_data.get("explanation", "A curated look styled by AI."),
@@ -295,7 +264,7 @@ Double-check: each index must come from a DIFFERENT category. ONLY JSON, nothing
         except Exception as e:
             print(f"AI outfit selection failed: {e}")
 
-    # Fallback random — also enforces one per category
+    # Fallback random
     tops = [i for i, item in enumerate(wardrobe) if item.get("category") == "top"]
     bottoms = [i for i, item in enumerate(wardrobe) if item.get("category") == "bottom"]
     shoes = [i for i, item in enumerate(wardrobe) if item.get("category") == "shoes"]
@@ -427,6 +396,7 @@ ONLY JSON, nothing else.""",
     matches = []
     for i, item in enumerate(wardrobe):
         cat = item.get("category", "")
+        # Items that complement (different category = potential pair)
         if cat != new_cat:
             matches.append(i)
 
@@ -440,14 +410,15 @@ ONLY JSON, nothing else.""",
     }
 
 
+# === ADDED: Privacy & Terms pages ===
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     return Path("privacy.html").read_text(encoding="utf-8")
 
-
 @app.get("/terms", response_class=HTMLResponse)
 async def terms():
     return Path("terms.html").read_text(encoding="utf-8")
+# === END ADDED ===
 
 
 if __name__ == "__main__":
