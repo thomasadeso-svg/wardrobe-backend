@@ -1,3 +1,5 @@
+from fastapi.responses import HTMLResponse
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -385,7 +387,13 @@ ONLY JSON, nothing else.""",
         "color_harmony": "",
         "style_fit": "",
     }
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy():
+    return Path("privacy.html").read_text(encoding="utf-8")
 
+@app.get("/terms", response_class=HTMLResponse)
+async def terms():
+    return Path("terms.html").read_text(encoding="utf-8")
 
 if __name__ == "__main__":
     import uvicorn
