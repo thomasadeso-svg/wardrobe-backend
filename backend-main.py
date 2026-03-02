@@ -96,14 +96,33 @@ async def analyze_clothing(file: UploadFile = File(...)):
                     },
                     {
                         "type": "text",
-                        "text": """You are a fashion wardrobe assistant. Analyze this image.
+                        "text": """You are a strict fashion wardrobe gatekeeper. Your job is to ONLY accept real clothing items and fashion accessories.
 
-FIRST: Determine if this is a clothing item, shoes, bag, jewelry, or fashion accessory.
+STEP 1 — STRICTLY determine if this image shows ONE of these:
+ACCEPTED: shirts, t-shirts, blouses, sweaters, hoodies, jackets, coats, blazers, vests, pants, jeans, shorts, skirts, dresses, shoes, sneakers, boots, sandals, heels, bags, handbags, backpacks, belts, watches, necklaces, bracelets, rings, earrings, sunglasses, scarves, hats, caps, ties, gloves, socks
 
-If this is NOT a fashion/clothing item (e.g. food, animals, furniture, people without focus on clothes, random objects, electronics, etc.), return ONLY this JSON:
-{"rejected": true, "reason": "This doesn't look like a clothing item or accessory. Please photograph a piece of clothing, shoes, bag, jewelry, or accessory."}
+REJECTED (return rejected=true for ALL of these):
+- People, selfies, faces, body parts
+- Food, drinks, plates, kitchen items
+- Animals, pets
+- Cars, vehicles, bikes
+- Furniture, rooms, buildings, landscapes
+- Electronics, phones, laptops, TVs
+- Books, papers, documents
+- Plants, flowers, trees
+- Toys, games
+- Tools, hardware
+- Money, cards
+- ANY object that is not worn on the body as clothing or fashion accessory
+- Blurry, unclear, or unrecognizable images
+- Multiple items in one photo (user should photograph ONE item at a time)
 
-If this IS a valid fashion item, return ONLY this JSON:
+If REJECTED, return ONLY:
+{"rejected": true, "reason": "This doesn't look like a clothing item or accessory. Please photograph a single piece of clothing, shoes, bag, jewelry, or accessory."}
+
+Be VERY strict. When in doubt, REJECT. Only accept items that are clearly wearable fashion items.
+
+STEP 2 — If this IS a valid single fashion item, return ONLY this JSON:
 {
   "rejected": false,
   "category": "top" or "bottom" or "shoes" or "outerwear" or "bag" or "jewelry" or "accessory",
@@ -434,3 +453,4 @@ async def terms():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
