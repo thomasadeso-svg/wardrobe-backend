@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from pathlib import Path
@@ -9,8 +9,6 @@ import base64
 import json
 import random
 import re
-import hashlib
-from typing import Dict, Any
 from PIL import Image, ImageEnhance
 from rembg import remove, new_session
 
@@ -26,66 +24,25 @@ allow_headers=["*"],
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# -----------------------------
-# SPEED SETTINGS
-# -----------------------------
-REMOVE_BG_MAX = int(os.getenv("REMOVE_BG_MAX", "1024")) # rembg input size
-ANALYZE_MAX = int(os.getenv("ANALYZE_MAX", "768")) # Claude input size
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "82")) # speed/quality balance
+# ---- Rembg session handling (NO crash on startup) ----
+FAST_SESSION = None
+FAST_MODEL_NAME = os.getenv("REMBG_MODEL", "u2netp") # fast + lightweight
 
-# -----------------------------
-# IMPORTANT: Lazy-load rembg session to avoid Railway boot crash
-# -----------------------------
-fast_session = None
-
-def get_fast_session():
-global fast_session
-if fast_session is None:
-# lightweight faster model
-fast_session = new_session("u2netp")
-return fast_session
-
-# -----------------------------
-# Small in-memory caches (optional but fast for repeated tests)
-# -----------------------------
-REMOVE_BG_CACHE: Dict[str, str] = {}
-ANALYZE_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_LIMIT = 80 # keep small for Railway memory
-
-ALLOWED_CATEGORIES = {"top", "bottom", "shoes", "outerwear", "bag", "jewelry", "accessory"}
-
-def _hash_bytes(b: bytes) -> str:
-return hashlib.sha256(b).hexdigest()
-
-def _cache_set(cache: dict, key: str, value):
-cache[key] = value
-if len(cache) > CACHE_LIMIT:
-first = next(iter(cache))
-cache.pop(first, None)
-
-def _extract_json(text: str) -> Dict[str, Any]:
-if not text:
-return {}
-m = re.search(r"\{.*\}", text, re.DOTALL)
-if not m:
-return {}
+@app.on_event("startup")
+async def startup_event():
+"""
+Try to warm up rembg, but NEVER crash the server if it fails.
+Railway sometimes has no permission/cache issues on cold start.
+"""
+global FAST_SESSION
 try:
-return json.loads(m.group(0))
-except:
-return {}
-
-def _resize_to_max(contents: bytes, max_side: int) -> bytes:
-"""
-Resize + convert to JPEG for faster upload/inference.
-"""
-img = Image.open(io.BytesIO(contents))
-img = img.convert("RGB")
-if max(img.size) > max_side:
-img.thumbnail((max_side, max_side), Image.LANCZOS)
-buf = io.BytesIO()
-img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-return buf.getvalue()
-
+# Use /tmp in containers to avoid permission issues
+os.environ.setdefault("U2NET_HOME", "/tmp")
+FAST_SESSION = new_session(FAST_MODEL_NAME)
+print(f"[startup] rembg session ready: {FAST_MODEL_NAME}")
+except Exception as e:
+FAST_SESSION = None
+print(f"[startup] rembg session failed, will fallback to default remove(): {e}")
 
 @app.get("/")
 async def root():
@@ -93,49 +50,111 @@ return {
 "status": "live",
 "service": "styligma-v2",
 "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item", "/privacy", "/terms"],
-"rembg": True,
-"claude": bool(ANTHROPIC_API_KEY),
+"rembg_session_ready": bool(FAST_SESSION),
+"claude": bool(client),
 }
 
+# ---------- Helpers ----------
+def _extract_json(text: str) -> dict:
+# robust JSON extraction
+match = re.search(r"\{.*\}", text, re.DOTALL)
+if not match:
+raise ValueError("No JSON object found in model response")
+return json.loads(match.group(0))
 
-# =========================================================
-# REMOVE BACKGROUND (FAST + STABLE)
-# =========================================================
+ALLOWED_CATEGORIES = {"top", "bottom", "shoes", "outerwear", "bag", "jewelry", "accessory"}
+ALLOWED_STYLES = {"casual", "formal", "sporty", "streetwear", "elegant", "bohemian"}
+
+# Strong “not clothing” keywords (fix: cup mistaken as clothing)
+FORBIDDEN_KEYWORDS = {
+"cup","mug","glass","bottle","plate","fork","spoon","food","drink","coffee","tea",
+"phone","laptop","keyboard","mouse","tv","remote","book","toy","tool","furniture",
+"chair","table","sofa","plant","flower","pet","dog","cat","car","vehicle"
+}
+
+def _looks_forbidden(result: dict) -> bool:
+blob = " ".join([
+str(result.get("name","")),
+str(result.get("subcategory","")),
+str(result.get("category","")),
+str(result.get("reason","")),
+]).lower()
+return any(k in blob for k in FORBIDDEN_KEYWORDS)
+
+def _validate_clothing_json(result: dict) -> dict:
+"""
+If Claude says accepted but the output is suspicious -> force reject.
+This fixes “cup = clothing” and other nonsense.
+"""
+if result.get("rejected") is True:
+return result
+
+# Must have required fields and valid enum-like values
+cat = str(result.get("category","")).lower().strip()
+style = str(result.get("style","")).lower().strip()
+
+if cat not in ALLOWED_CATEGORIES:
+return {
+"rejected": True,
+"reason": "Das Bild wurde nicht eindeutig als Kleidungsstück/Accessoire erkannt. Bitte fotografiere ein einzelnes Kleidungsstück (z.B. Shirt, Hose, Schuhe, Tasche, Schmuck)."
+}
+
+if style and style not in ALLOWED_STYLES:
+# normalize unknown style to casual (don’t reject for this)
+result["style"] = "casual"
+
+# If keywords indicate non-clothing -> reject hard
+if _looks_forbidden(result):
+return {
+"rejected": True,
+"reason": "Das sieht nicht nach Kleidung oder einem tragbaren Accessoire aus. Bitte fotografiere ein einzelnes Kleidungsstück, Schuhe, Tasche oder Schmuck."
+}
+
+# Ensure minimal fields
+result.setdefault("colors", [result.get("color","unknown")])
+result.setdefault("season", ["spring", "summer", "fall", "winter"])
+result.setdefault("fabric_guess", "unknown")
+result.setdefault("subcategory", "item")
+result.setdefault("name", "Kleidungsstück")
+
+return result
+
+# ---------- Endpoints ----------
 @app.post("/remove-background")
 async def remove_background(file: UploadFile = File(...)):
 try:
 input_data = await file.read()
 if not input_data:
-return JSONResponse(status_code=400, content={"success": False, "error": "Empty file"})
+raise HTTPException(status_code=400, detail="Empty file")
 
-# cache hit
-key = _hash_bytes(input_data)
-if key in REMOVE_BG_CACHE:
-return {
-"success": True,
-"image": REMOVE_BG_CACHE[key],
-"method": "rembg-local-fast-cache",
-}
+# Faster: resize a bit more aggressive (1024 -> 768)
+img_input = Image.open(io.BytesIO(input_data))
+img_input = img_input.convert("RGBA") # normalize
+max_size = int(os.getenv("REMBG_MAX_SIZE", "768"))
+if max(img_input.size) > max_size:
+img_input.thumbnail((max_size, max_size), Image.LANCZOS)
 
-# Resize to max 1024 BEFORE rembg (cuts big time)
-resized_jpg = _resize_to_max(input_data, REMOVE_BG_MAX)
+buf_resized = io.BytesIO()
+img_input.save(buf_resized, format="PNG", optimize=True)
+resized_data = buf_resized.getvalue()
 
-# Lazy session init (prevents deployment crash)
-session = get_fast_session()
+# Use session if available, otherwise fallback
+if FAST_SESSION:
+output_data = remove(resized_data, session=FAST_SESSION)
+method = "rembg-local-fast-session"
+else:
+output_data = remove(resized_data)
+method = "rembg-local-fallback"
 
-# remove bg
-output_data = remove(resized_jpg, session=session)
-
-# Boost color saturation (kept from your code, but slightly lighter)
+# Optional enhance (can disable via env for speed)
+enhance = os.getenv("REMBG_ENHANCE", "1") == "1"
 img = Image.open(io.BytesIO(output_data)).convert("RGBA")
+
+if enhance:
 r, g, b, a = img.split()
 rgb_img = Image.merge("RGB", (r, g, b))
-
-enhancer = ImageEnhance.Color(rgb_img)
-rgb_img = enhancer.enhance(1.18)
-enhancer = ImageEnhance.Contrast(rgb_img)
-rgb_img = enhancer.enhance(1.08)
-
+rgb_img = ImageEnhance.Color(rgb_img).enhance(1.25)
+rgb_img = ImageEnhance.Contrast(rgb_img).enhance(1.08)
 r2, g2, b2 = rgb_img.split()
 img = Image.merge("RGBA", (r2, g2, b2, a))
 
@@ -143,68 +162,67 @@ buf = io.BytesIO()
 img.save(buf, format="PNG", optimize=True)
 base64_image = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-data_url = f"data:image/png;base64,{base64_image}"
-_cache_set(REMOVE_BG_CACHE, key, data_url)
-
 return {
 "success": True,
-"image": data_url,
-"method": "rembg-local-fast",
+"image": f"data:image/png;base64,{base64_image}",
+"method": method,
+"max_size": max_size,
+"enhance": enhance,
 }
 
+except HTTPException as e:
+raise e
 except Exception as e:
 return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
 
-# =========================================================
-# ANALYZE CLOTHING (FAST + "CUP BUG" FIXED)
-# =========================================================
 @app.post("/analyze-clothing")
 async def analyze_clothing(file: UploadFile = File(...)):
 try:
 if not client:
-return {
-"rejected": True,
-"reason": "AI not available. Please try again later with a clear clothing photo."
-}
+return JSONResponse(
+status_code=503,
+content={"rejected": True, "reason": "AI Analyse ist aktuell nicht verfügbar (API-Key fehlt)."},
+)
 
 contents = await file.read()
 if not contents:
-return JSONResponse(status_code=400, content={"rejected": True, "reason": "Empty file"})
+raise HTTPException(status_code=400, detail="Empty file")
 
-# cache hit
-key = _hash_bytes(contents)
-if key in ANALYZE_CACHE:
-return JSONResponse(content=ANALYZE_CACHE[key])
-
-# SPEED: resize for Claude
-resized_jpg = _resize_to_max(contents, ANALYZE_MAX)
-base64_image = base64.b64encode(resized_jpg).decode("utf-8")
+base64_image = base64.b64encode(contents).decode("utf-8")
 
 message = client.messages.create(
 model="claude-sonnet-4-20250514",
-max_tokens=420, # faster
+max_tokens=512,
 messages=[{
 "role": "user",
 "content": [
 {
 "type": "image",
-"source": {"type": "base64", "media_type": "image/jpeg", "data": base64_image},
+"source": {
+"type": "base64",
+"media_type": file.content_type or "image/jpeg",
+"data": base64_image
+},
 },
 {
 "type": "text",
 "text": """You are a strict fashion wardrobe gatekeeper. Your ONLY job is to accept real clothing items and fashion accessories, and REJECT everything else.
 
-ABSOLUTE REJECT (must reject):
-cups/mugs, food, drinks, electronics, laptops, phones, furniture, rooms, landscapes, plants, toys, tools, animals, people/selfies/faces/body parts, or ANY object that is not worn on the body.
-If blurry or unclear: REJECT.
+STEP 1 — Is this a wearable fashion item?
 
-When in doubt: REJECT.
+ACCEPTED (return rejected=false):
+Shirts, t-shirts, blouses, sweaters, hoodies, jackets, coats, blazers, vests, pants, jeans, shorts, skirts, dresses, shoes, sneakers, boots, sandals, heels, bags, handbags, backpacks, belts, watches, necklaces, bracelets, rings, earrings, sunglasses, scarves, hats, caps, ties, gloves, socks.
+
+REJECTED (return rejected=true):
+People, selfies, faces, body parts, food, drinks, animals, pets, cars, vehicles, furniture, rooms, buildings, landscapes, electronics, phones, laptops, books, plants, flowers, toys, tools, money, cups, mugs, plates, or ANY object that is not worn on the body. Also reject blurry or unrecognizable images.
+
+When in doubt, REJECT.
 
 If REJECTED, return ONLY this JSON:
 {"rejected": true, "reason": "This doesn't look like a clothing item or accessory. Please photograph a single piece of clothing, shoes, bag, jewelry, or accessory."}
 
-If ACCEPTED, return ONLY this JSON:
+STEP 2 — If ACCEPTED, return ONLY this JSON:
 {
 "rejected": false,
 "category": "top" or "bottom" or "shoes" or "outerwear" or "bag" or "jewelry" or "accessory",
@@ -223,55 +241,22 @@ Return ONLY the JSON, no other text.""",
 }],
 )
 
-response_text = message.content[0].text.strip() if message.content else ""
+response_text = message.content[0].text.strip()
 result = _extract_json(response_text)
 
-# HARD SERVER VALIDATION (prevents cup => clothing permanently)
-if not isinstance(result, dict) or "rejected" not in result:
-safe = {
-"rejected": True,
-"reason": "Could not analyze this image. Please try again with a clear photo of a clothing item."
-}
-_cache_set(ANALYZE_CACHE, key, safe)
-return JSONResponse(content=safe)
+# HARD server-side validation (fixes “cup=clothing”)
+result = _validate_clothing_json(result)
 
-if result.get("rejected") is True:
-safe = {"rejected": True, "reason": result.get("reason") or "Not a clothing item or accessory."}
-_cache_set(ANALYZE_CACHE, key, safe)
-return JSONResponse(content=safe)
-
-cat = str(result.get("category", "")).lower().strip()
-if cat not in ALLOWED_CATEGORIES:
-safe = {
-"rejected": True,
-"reason": "This doesn't look like a clothing item or accessory. Please photograph a single fashion item."
-}
-_cache_set(ANALYZE_CACHE, key, safe)
-return JSONResponse(content=safe)
-
-# normalize output so frontend never crashes
-result["category"] = cat
-if not isinstance(result.get("colors"), list):
-result["colors"] = [result.get("color")] if result.get("color") else []
-if not isinstance(result.get("season"), list):
-result["season"] = ["all-season"]
-
-_cache_set(ANALYZE_CACHE, key, result)
 return JSONResponse(content=result)
 
+except HTTPException as e:
+raise e
 except json.JSONDecodeError:
-safe = {
-"rejected": True,
-"reason": "Could not analyze this image. Please try again with a clear photo of a clothing item."
-}
-return JSONResponse(content=safe)
+return {"rejected": True, "reason": "Konnte das Bild nicht analysieren. Bitte versuche es erneut mit einem klaren Foto eines Kleidungsstücks."}
 except Exception as e:
 return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-# =========================================================
-# GENERATE OUTFIT (UNCHANGED FROM YOUR CODE)
-# =========================================================
 @app.post("/generate-outfit")
 async def generate_outfit(request: dict):
 wardrobe = request.get("wardrobe", [])
@@ -281,11 +266,7 @@ previous_outfits = request.get("previous_outfits", [])
 style_profile = request.get("style_profile", None)
 
 if len(wardrobe) < 2:
-return {
-"outfit": [],
-"explanation": "Add more items! You need at least one top and one bottom.",
-"styling_tip": "",
-}
+return {"outfit": [], "explanation": "Add more items! You need at least one top and one bottom.", "styling_tip": ""}
 
 items_list = []
 for i, item in enumerate(wardrobe):
@@ -298,10 +279,7 @@ items_text = "\n".join(items_list)
 
 avoid_text = ""
 if previous_outfits:
-avoid_lines = []
-for prev in previous_outfits[-5:]:
-avoid_lines.append(str(prev))
-avoid_text = f"\n\nAVOID these combinations (already shown):\n" + "\n".join(avoid_lines)
+avoid_text = "\n\nAVOID these combinations (already shown):\n" + "\n".join(str(p) for p in previous_outfits[-5:])
 
 profile_text = ""
 if style_profile:
@@ -311,7 +289,7 @@ parts.append(f"Style vibe: {style_profile['vibe']}")
 if style_profile.get("colors"):
 parts.append(f"Preferred colors: {', '.join(style_profile['colors'])}")
 if style_profile.get("avoid"):
-avoid_colors = [c for c in style_profile['avoid'] if c != 'none']
+avoid_colors = [c for c in style_profile["avoid"] if c != "none"]
 if avoid_colors:
 parts.append(f"Colors to AVOID: {', '.join(avoid_colors)}")
 if style_profile.get("bodyFocus"):
@@ -348,89 +326,61 @@ STRICT RULES — MUST FOLLOW:
 
 ABSOLUTE RULES:
 - NEVER pick 2 items from the same category
-- NEVER pick 2 tops, 2 bottoms, 2 shoes, or 2 outerwear
-- Each category appears AT MOST ONCE
 - Total items: 3-5, never more
-
-VARIETY RULES:
-- DO NOT repeat previous combinations
-- Rotate through available items
-
-STYLE RULES:
-- Focus on COLOR HARMONY: complementary, analogous, or monochrome palettes
-- Match STYLE: don't mix sporty with elegant unless streetwear
-- Consider fabric/texture combos
-- Be creative — surprise with unexpected but fashionable pairings
 
 Return ONLY JSON:
 {{
 "selected_indices": [0, 3, 5],
 "explanation": "Why these pieces work — mention specific colors and textures",
 "styling_tip": "One specific actionable tip for wearing this outfit"
-}}
-
-selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""",
+}}""",
 }],
 )
 
 pick_text = pick_response.content[0].text.strip()
-match = re.search(r'\{.*\}', pick_text, re.DOTALL)
-if not match:
-raise ValueError("Claude didn't return valid JSON")
-
-pick_data = json.loads(match.group(0))
+pick_data = _extract_json(pick_text)
 indices = pick_data.get("selected_indices", [])
 valid_indices = [i for i in indices if 0 <= i < len(wardrobe)]
 
 seen_categories = set()
-deduplicated = []
+dedup = []
 for i in valid_indices:
 cat = wardrobe[i].get("category", "unknown").lower().strip()
 if cat not in seen_categories:
 seen_categories.add(cat)
-deduplicated.append(i)
+dedup.append(i)
 
 category_order = {"outerwear": 0, "top": 1, "bottom": 2, "shoes": 3, "bag": 4, "jewelry": 5, "accessory": 6}
-deduplicated.sort(key=lambda x: category_order.get(wardrobe[x].get("category", "unknown").lower().strip(), 99))
+dedup.sort(key=lambda x: category_order.get(wardrobe[x].get("category", "unknown").lower().strip(), 99))
 
-valid_indices = deduplicated
-
-if valid_indices:
+if dedup:
 return {
-"outfit": [{"item_index": i} for i in valid_indices],
+"outfit": [{"item_index": i} for i in dedup],
 "explanation": pick_data.get("explanation", "A curated look styled by AI."),
 "styling_tip": pick_data.get("styling_tip", "Own it with confidence."),
 }
 except Exception as e:
 print(f"AI outfit selection failed: {e}")
 
-tops = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "top"]
-bottoms = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "bottom"]
-shoes = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "shoes"]
-outerwear = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "outerwear"]
+# fallback
+tops = [i for i, it in enumerate(wardrobe) if it.get("category","").lower()=="top"]
+bottoms = [i for i, it in enumerate(wardrobe) if it.get("category","").lower()=="bottom"]
+shoes = [i for i, it in enumerate(wardrobe) if it.get("category","").lower()=="shoes"]
+outerwear = [i for i, it in enumerate(wardrobe) if it.get("category","").lower()=="outerwear"]
 
 if not tops or not bottoms:
 return {"outfit": [], "explanation": "Need at least one top and one bottom.", "styling_tip": ""}
 
-for lst in [tops, bottoms, shoes, outerwear]:
-random.shuffle(lst)
+random.shuffle(tops); random.shuffle(bottoms); random.shuffle(shoes); random.shuffle(outerwear)
 
 selected = [{"item_index": tops[0]}, {"item_index": bottoms[0]}]
-if shoes:
-selected.append({"item_index": shoes[0]})
-if outerwear and weather in ["cold", "moderate"]:
+if shoes: selected.append({"item_index": shoes[0]})
+if outerwear and weather in ["cold","moderate"]:
 selected.insert(0, {"item_index": outerwear[0]})
 
-return {
-"outfit": selected,
-"explanation": "A fresh combination from your wardrobe.",
-"styling_tip": "Mix textures for a balanced silhouette.",
-}
+return {"outfit": selected, "explanation": "A fresh combination from your wardrobe.", "styling_tip": "Mix textures for a balanced silhouette."}
 
 
-# =========================================================
-# MATCH ITEM (UNCHANGED)
-# =========================================================
 @app.post("/match-item")
 async def match_item(request: dict):
 new_item = request.get("new_item", {})
@@ -438,12 +388,7 @@ wardrobe = request.get("wardrobe", [])
 occasion = request.get("occasion", "casual")
 
 if not new_item or len(wardrobe) < 1:
-return {
-"matches": [],
-"outfits": [],
-"verdict": "Add more items to your wardrobe first.",
-"match_count": 0,
-}
+return {"matches": [], "outfits": [], "verdict": "Add more items to your wardrobe first.", "match_count": 0}
 
 items_list = []
 for i, item in enumerate(wardrobe):
@@ -469,54 +414,32 @@ messages=[{
 "role": "user",
 "content": f"""You are an expert fashion stylist for "Styligma ✧".
 
-A user is considering BUYING this new item:
 NEW ITEM: {new_item_desc}
 
-Their current WARDROBE:
+WARDROBE:
 {items_text}
-
-TASK: Determine how well this new item fits into their existing wardrobe.
-
-1. Find ALL wardrobe items that would pair well with this new item
-2. Suggest up to 3 complete outfits using the new item + wardrobe items
-3. Give a verdict: is this a SMART BUY or redundant?
 
 Return ONLY JSON:
 {{
-"match_count": <number of items that pair well>,
-"matching_indices": [list of wardrobe indices that pair with the new item],
-"outfits": [
-{{
-"wardrobe_indices": [indices from wardrobe to combine with new item],
-"description": "Short outfit description"
-}}
-],
-"verdict": "SMART BUY: <reason>" or "SKIP: <reason>" or "MAYBE: <reason>",
-"color_harmony": "Brief note on how the new item's color works with wardrobe",
-"style_fit": "How well it matches the user's overall style"
-}}
-
-Be honest — if the user already has something similar, say SKIP. If it fills a gap, say SMART BUY.
-ONLY JSON, nothing else.""",
+"match_count": <number>,
+"matching_indices": [indices],
+"outfits": [{{"wardrobe_indices":[indices], "description":"..."}}],
+"verdict": "SMART BUY: ..." or "SKIP: ..." or "MAYBE: ...",
+"color_harmony": "...",
+"style_fit": "..."
+}}""",
 }],
 )
 
 pick_text = response.content[0].text.strip()
-match = re.search(r'\{.*\}', pick_text, re.DOTALL)
-if not match:
-raise ValueError("Claude didn't return valid JSON")
-
-result = json.loads(match.group(0))
+result = _extract_json(pick_text)
 
 valid_matches = [i for i in result.get("matching_indices", []) if 0 <= i < len(wardrobe)]
 valid_outfits = []
 for outfit in result.get("outfits", [])[:3]:
 valid_idx = [i for i in outfit.get("wardrobe_indices", []) if 0 <= i < len(wardrobe)]
 if valid_idx:
-valid_outfits.append({
-"wardrobe_indices": valid_idx,
-"description": outfit.get("description", ""),
-})
+valid_outfits.append({"wardrobe_indices": valid_idx, "description": outfit.get("description","")})
 
 return {
 "match_count": len(valid_matches),
@@ -526,16 +449,13 @@ return {
 "color_harmony": result.get("color_harmony", ""),
 "style_fit": result.get("style_fit", ""),
 }
+
 except Exception as e:
 print(f"Match item failed: {e}")
 
+# fallback
 new_cat = new_item.get("category", "")
-matches = []
-for i, item in enumerate(wardrobe):
-cat = item.get("category", "")
-if cat != new_cat:
-matches.append(i)
-
+matches = [i for i, it in enumerate(wardrobe) if it.get("category","") != new_cat]
 return {
 "match_count": len(matches),
 "matching_indices": matches[:10],
@@ -558,5 +478,5 @@ return Path("terms.html").read_text(encoding="utf-8")
 
 if __name__ == "__main__":
 import uvicorn
+# IMPORTANT: run "backend-main:app" in Procfile on Railway (recommended)
 uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
