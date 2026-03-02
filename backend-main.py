@@ -8,8 +8,9 @@ import io
 import base64
 import json
 import random
+import re
 from PIL import Image, ImageEnhance
-from rembg import remove
+from rembg import remove, new_session
 
 app = FastAPI()
 
@@ -23,6 +24,8 @@ app.add_middleware(
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
+# PRE-LOAD the lightweight, fast background removal model!
+fast_session = new_session("u2netp")
 
 @app.get("/")
 async def root():
@@ -49,7 +52,8 @@ async def remove_background(file: UploadFile = File(...)):
             img_input.save(buf_resized, format="PNG")
             input_data = buf_resized.getvalue()
 
-        output_data = remove(input_data)
+        # USE THE FAST SESSION HERE
+        output_data = remove(input_data, session=fast_session)
 
         # Boost color saturation for vivid images
         img = Image.open(io.BytesIO(output_data)).convert("RGBA")
@@ -71,7 +75,7 @@ async def remove_background(file: UploadFile = File(...)):
         return {
             "success": True,
             "image": f"data:image/png;base64,{base64_image}",
-            "method": "rembg-local-free",
+            "method": "rembg-local-fast",
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
@@ -130,11 +134,13 @@ Return ONLY the JSON, no other text.""",
         )
 
         response_text = message.content[0].text.strip()
-        if response_text.startswith("```"):
-            response_text = response_text.split("\n", 1)[1]
-            response_text = response_text.rsplit("```", 1)[0].strip()
-
-        result = json.loads(response_text)
+        
+        # NEW FAIL-PROOF JSON EXTRACTOR
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not match:
+            raise ValueError("Claude didn't return valid JSON")
+            
+        result = json.loads(match.group(0))
         return JSONResponse(content=result)
     except json.JSONDecodeError:
         return {"rejected": True, "reason": "Could not analyze this image. Please try again with a clear photo of a clothing item."}
@@ -247,22 +253,30 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
             )
 
             pick_text = pick_response.content[0].text.strip()
-            if pick_text.startswith("```"):
-                pick_text = pick_text.split("\n", 1)[1]
-                pick_text = pick_text.rsplit("```", 1)[0].strip()
-
-            pick_data = json.loads(pick_text)
+            
+            # NEW FAIL-PROOF JSON EXTRACTOR
+            match = re.search(r'\{.*\}', pick_text, re.DOTALL)
+            if not match:
+                raise ValueError("Claude didn't return valid JSON")
+                
+            pick_data = json.loads(match.group(0))
             indices = pick_data.get("selected_indices", [])
             valid_indices = [i for i in indices if 0 <= i < len(wardrobe)]
 
-            # Server-side safety: remove duplicate categories
+            # NEW: Server-side safety to remove duplicate categories & handle capitalization
             seen_categories = set()
             deduplicated = []
+            
             for i in valid_indices:
-                cat = wardrobe[i].get("category", "unknown")
+                cat = wardrobe[i].get("category", "unknown").lower().strip() 
                 if cat not in seen_categories:
                     seen_categories.add(cat)
                     deduplicated.append(i)
+            
+            # NEW: SORT TOP TO BOTTOM
+            category_order = {"outerwear": 0, "top": 1, "bottom": 2, "shoes": 3, "bag": 4, "jewelry": 5, "accessory": 6}
+            deduplicated.sort(key=lambda x: category_order.get(wardrobe[x].get("category", "unknown").lower().strip(), 99))
+            
             valid_indices = deduplicated
 
             if valid_indices:
@@ -275,10 +289,10 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
             print(f"AI outfit selection failed: {e}")
 
     # Fallback random
-    tops = [i for i, item in enumerate(wardrobe) if item.get("category") == "top"]
-    bottoms = [i for i, item in enumerate(wardrobe) if item.get("category") == "bottom"]
-    shoes = [i for i, item in enumerate(wardrobe) if item.get("category") == "shoes"]
-    outerwear = [i for i, item in enumerate(wardrobe) if item.get("category") == "outerwear"]
+    tops = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "top"]
+    bottoms = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "bottom"]
+    shoes = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "shoes"]
+    outerwear = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "outerwear"]
 
     if not tops or not bottoms:
         return {"outfit": [], "explanation": "Need at least one top and one bottom.", "styling_tip": ""}
@@ -290,7 +304,7 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
     if shoes:
         selected.append({"item_index": shoes[0]})
     if outerwear and weather in ["cold", "moderate"]:
-        selected.append({"item_index": outerwear[0]})
+        selected.insert(0, {"item_index": outerwear[0]}) # Insert outerwear at top
 
     return {
         "outfit": selected,
@@ -370,11 +384,13 @@ ONLY JSON, nothing else.""",
             )
 
             pick_text = response.content[0].text.strip()
-            if pick_text.startswith("```"):
-                pick_text = pick_text.split("\n", 1)[1]
-                pick_text = pick_text.rsplit("```", 1)[0].strip()
-
-            result = json.loads(pick_text)
+            
+            # NEW FAIL-PROOF JSON EXTRACTOR
+            match = re.search(r'\{.*\}', pick_text, re.DOTALL)
+            if not match:
+                raise ValueError("Claude didn't return valid JSON")
+                
+            result = json.loads(match.group(0))
 
             valid_matches = [i for i in result.get("matching_indices", []) if 0 <= i < len(wardrobe)]
             valid_outfits = []
@@ -427,4 +443,3 @@ async def terms():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
