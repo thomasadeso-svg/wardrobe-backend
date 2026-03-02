@@ -9,7 +9,7 @@ import base64
 import json
 import random
 from PIL import Image, ImageEnhance
-from rembg import remove, new_session
+from rembg import remove
 
 app = FastAPI()
 
@@ -22,9 +22,6 @@ app.add_middleware(
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
-
-# Pre-load fast rembg model once at startup (not per request)
-rembg_session = new_session("u2netp")
 
 
 @app.get("/")
@@ -43,7 +40,7 @@ async def remove_background(file: UploadFile = File(...)):
     try:
         input_data = await file.read()
 
-        # Resize large images before processing (huge speed boost)
+        # Resize large images before processing (big speed boost)
         img_input = Image.open(io.BytesIO(input_data))
         max_size = 1024
         if max(img_input.size) > max_size:
@@ -52,8 +49,8 @@ async def remove_background(file: UploadFile = File(...)):
             img_input.save(buf_resized, format="PNG")
             input_data = buf_resized.getvalue()
 
-        # Use pre-loaded fast model
-        output_data = remove(input_data, session=rembg_session)
+        # Use default model (best quality) — speed comes from resize above
+        output_data = remove(input_data)
 
         # Boost color saturation for vivid images
         img = Image.open(io.BytesIO(output_data)).convert("RGBA")
@@ -75,7 +72,7 @@ async def remove_background(file: UploadFile = File(...)):
         return {
             "success": True,
             "image": f"data:image/png;base64,{base64_image}",
-            "method": "rembg-fast",
+            "method": "rembg-optimized",
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
@@ -153,15 +150,26 @@ async def generate_outfit(request: dict):
             "styling_tip": "",
         }
 
+    # Categorize all wardrobe items
+    by_category = {"top": [], "bottom": [], "shoes": [], "outerwear": [], "bag": [], "jewelry": [], "accessory": []}
+    for i, item in enumerate(wardrobe):
+        cat = item.get("category", "top")
+        if cat in by_category:
+            by_category[cat].append(i)
+
     # Build numbered item list for Claude
     items_list = []
     for i, item in enumerate(wardrobe):
         items_list.append(
-            f"[{i}] {item.get('name', 'Item')} — {item.get('category', '?')}, "
+            f"[{i}] {item.get('name', 'Item')} — category: {item.get('category', '?')}, "
             f"Color: {item.get('color', '?')}, Style: {item.get('style', '?')}, "
             f"Sub: {item.get('subcategory', '?')}"
         )
     items_text = "\n".join(items_list)
+
+    # Show available categories to Claude
+    available_cats = {cat: idxs for cat, idxs in by_category.items() if idxs}
+    category_summary = "\n".join(f"  {cat}: indices {idxs}" for cat, idxs in available_cats.items())
 
     # Format previous outfits so Claude avoids them
     avoid_text = ""
@@ -169,7 +177,7 @@ async def generate_outfit(request: dict):
         avoid_lines = []
         for prev in previous_outfits[-5:]:
             avoid_lines.append(str(prev))
-        avoid_text = f"\n\nAVOID these combinations (already shown):\n" + "\n".join(avoid_lines)
+        avoid_text = f"\n\nAVOID these exact combinations (already shown):\n" + "\n".join(avoid_lines)
 
     # Style profile personalization
     profile_text = ""
@@ -199,6 +207,9 @@ async def generate_outfit(request: dict):
 
 WARDROBE:
 {items_text}
+
+ITEMS GROUPED BY CATEGORY:
+{category_summary}
 {avoid_text}
 {profile_text}
 
@@ -206,35 +217,34 @@ Pick the BEST outfit for:
 - Occasion: {occasion}
 - Weather: {weather}
 
-RULES:
-- MUST pick 1 top + 1 bottom (required)
-- Pick shoes if available
-- Pick 1 bag/jewelry/accessory if it complements the look
+STRICT SELECTION RULES — YOU MUST FOLLOW THESE EXACTLY:
+1. Pick EXACTLY 1 "top" item (REQUIRED)
+2. Pick EXACTLY 1 "bottom" item (REQUIRED)
+3. Pick EXACTLY 1 "shoes" item (if available)
+4. Weather rules for outerwear:
+   - "cold" weather: Pick EXACTLY 1 "outerwear" item (REQUIRED)
+   - "moderate" weather: Optionally pick 1 "outerwear" item
+   - "hot" weather: Do NOT pick any outerwear
+5. Optionally pick 1 accessory/jewelry/bag item (max 1)
 
-WEATHER RULES (CRITICAL — follow strictly):
-- If weather is "cold": You MUST include outerwear (jacket/coat/hoodie). An outfit without outerwear in cold weather is INCOMPLETE. If the wardrobe has multiple outerwear items, vary your pick.
-- If weather is "moderate": Outerwear is optional — a light layer can work but isn't required.
-- If weather is "hot": Do NOT include outerwear. Pick lightweight, breathable items. Prefer short sleeves, linen, cotton.
+ABSOLUTE RULES — VIOLATION IS FORBIDDEN:
+- NEVER select 2 items from the same category
+- NEVER select 2 tops, 2 bottoms, 2 shoes, or 2 outerwear pieces
+- Each category appears AT MOST ONCE
+- The outfit should have 3-5 items total, never more
 
-VARIETY RULES:
-- DO NOT repeat previous combinations — pick DIFFERENT items each time
-- If you've used the same outerwear before, pick a different one
-- Rotate through available items — don't always default to the same jacket
+VARIETY: Pick DIFFERENT items than previous outfits shown above.
 
-STYLE RULES:
-- Focus on COLOR HARMONY: complementary, analogous, or monochrome palettes
-- Match STYLE: don't mix sporty with elegant unless streetwear
-- Consider fabric/texture combos
-- Be creative — surprise with unexpected but fashionable pairings
+STYLE: Focus on color harmony, occasion-appropriate pairings, and texture contrast.
 
-Return ONLY JSON:
+Return ONLY this JSON:
 {{
-  "selected_indices": [0, 3, 5],
-  "explanation": "Why these pieces work — mention specific colors and textures",
-  "styling_tip": "One specific actionable tip for wearing this outfit"
+  "selected_indices": [one index per category, 3-5 total],
+  "explanation": "Why these pieces work — mention colors and textures",
+  "styling_tip": "One actionable tip for wearing this outfit"
 }}
 
-selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""",
+Double-check: each index must come from a DIFFERENT category. ONLY JSON, nothing else.""",
                 }],
             )
 
@@ -247,7 +257,17 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
             indices = pick_data.get("selected_indices", [])
             valid_indices = [i for i in indices if 0 <= i < len(wardrobe)]
 
-            if valid_indices:
+            # ENFORCE server-side: no duplicate categories ever
+            seen_categories = set()
+            deduplicated = []
+            for i in valid_indices:
+                cat = wardrobe[i].get("category", "unknown")
+                if cat not in seen_categories:
+                    seen_categories.add(cat)
+                    deduplicated.append(i)
+            valid_indices = deduplicated
+
+            if valid_indices and len(valid_indices) >= 2:
                 return {
                     "outfit": [{"item_index": i} for i in valid_indices],
                     "explanation": pick_data.get("explanation", "A curated look styled by AI."),
@@ -256,7 +276,7 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
         except Exception as e:
             print(f"AI outfit selection failed: {e}")
 
-    # Fallback random
+    # Fallback random — also enforces one per category
     tops = [i for i, item in enumerate(wardrobe) if item.get("category") == "top"]
     bottoms = [i for i, item in enumerate(wardrobe) if item.get("category") == "bottom"]
     shoes = [i for i, item in enumerate(wardrobe) if item.get("category") == "shoes"]
@@ -414,4 +434,3 @@ async def terms():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
