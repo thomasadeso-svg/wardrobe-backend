@@ -442,4 +442,3 @@ return Path("terms.html").read_text(encoding="utf-8")
 if __name__ == "__main__":
 import uvicorn
 uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
