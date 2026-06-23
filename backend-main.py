@@ -9,8 +9,8 @@ import base64
 import json
 import random
 import re
+import requests
 from PIL import Image, ImageEnhance
-from rembg import remove, new_session
 
 app = FastAPI()
 
@@ -22,16 +22,8 @@ allow_headers=["*"],
 )
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+REMOVE_BG_API_KEY = os.getenv("REMOVE_BG_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
-
-# Pre-load u2net model at startup so it doesn't download mid-request and OOM
-print("Pre-loading u2net model...")
-try:
-REMBG_SESSION = new_session("u2net")
-print("u2net model loaded successfully.")
-except Exception as e:
-print(f"Warning: Could not pre-load u2net: {e}")
-REMBG_SESSION = None
 
 
 @app.get("/")
@@ -40,7 +32,8 @@ return {
 "status": "live",
 "service": "styligma-v2",
 "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item", "/privacy", "/terms"],
-"rembg": True,
+"rembg": False,
+"remove_bg": bool(REMOVE_BG_API_KEY),
 "claude": bool(ANTHROPIC_API_KEY),
 }
 
@@ -50,20 +43,29 @@ async def remove_background(file: UploadFile = File(...)):
 try:
 input_data = await file.read()
 
-# Resize to max 1024px BEFORE rembg (cuts 15s -> 5s, keeps quality)
+# Resize to max 1024px before sending (saves API credits + faster)
 img_input = Image.open(io.BytesIO(input_data))
 max_size = 1024
 if max(img_input.size) > max_size:
 img_input.thumbnail((max_size, max_size), Image.LANCZOS)
 buf_resized = io.BytesIO()
-img_input.save(buf_resized, format="PNG")
+img_input.save(buf_resized, format="JPEG", quality=90)
 input_data = buf_resized.getvalue()
 
-# Use pre-loaded session
-output_data = remove(input_data, session=REMBG_SESSION)
+# Call remove.bg API
+response = requests.post(
+"https://api.remove.bg/v1.0/removebg",
+files={"image_file": ("image.jpg", input_data, "image/jpeg")},
+data={"size": "auto"},
+headers={"X-Api-Key": REMOVE_BG_API_KEY},
+timeout=30,
+)
+
+if response.status_code != 200:
+return JSONResponse(status_code=500, content={"success": False, "error": f"remove.bg error: {response.text}"})
 
 # Boost color saturation for vivid images
-img = Image.open(io.BytesIO(output_data)).convert("RGBA")
+img = Image.open(io.BytesIO(response.content)).convert("RGBA")
 r, g, b, a = img.split()
 rgb_img = Image.merge("RGB", (r, g, b))
 
@@ -82,7 +84,7 @@ base64_image = base64.b64encode(buf.getvalue()).decode("utf-8")
 return {
 "success": True,
 "image": f"data:image/png;base64,{base64_image}",
-"method": "rembg-local-free",
+"method": "remove-bg-api",
 }
 except Exception as e:
 return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
@@ -142,7 +144,6 @@ Return ONLY the JSON, no other text.""",
 
 response_text = message.content[0].text.strip()
 
-# Fail-proof JSON extraction
 match = re.search(r'\{.*\}', response_text, re.DOTALL)
 if not match:
 raise ValueError("Claude didn't return valid JSON")
@@ -170,7 +171,6 @@ return {
 "styling_tip": "",
 }
 
-# Build numbered item list for Claude
 items_list = []
 for i, item in enumerate(wardrobe):
 items_list.append(
@@ -180,7 +180,6 @@ f"Sub: {item.get('subcategory', '?')}"
 )
 items_text = "\n".join(items_list)
 
-# Format previous outfits so Claude avoids them
 avoid_text = ""
 if previous_outfits:
 avoid_lines = []
@@ -188,7 +187,6 @@ for prev in previous_outfits[-5:]:
 avoid_lines.append(str(prev))
 avoid_text = f"\n\nAVOID these combinations (already shown):\n" + "\n".join(avoid_lines)
 
-# Style profile personalization
 profile_text = ""
 if style_profile:
 parts = []
@@ -261,7 +259,6 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
 
 pick_text = pick_response.content[0].text.strip()
 
-# Fail-proof JSON extraction
 match = re.search(r'\{.*\}', pick_text, re.DOTALL)
 if not match:
 raise ValueError("Claude didn't return valid JSON")
@@ -270,7 +267,6 @@ pick_data = json.loads(match.group(0))
 indices = pick_data.get("selected_indices", [])
 valid_indices = [i for i in indices if 0 <= i < len(wardrobe)]
 
-# Server-side: remove duplicate categories
 seen_categories = set()
 deduplicated = []
 for i in valid_indices:
@@ -279,7 +275,6 @@ if cat not in seen_categories:
 seen_categories.add(cat)
 deduplicated.append(i)
 
-# Sort top to bottom: outerwear -> top -> bottom -> shoes -> accessories
 category_order = {"outerwear": 0, "top": 1, "bottom": 2, "shoes": 3, "bag": 4, "jewelry": 5, "accessory": 6}
 deduplicated.sort(key=lambda x: category_order.get(wardrobe[x].get("category", "unknown").lower().strip(), 99))
 
@@ -294,7 +289,6 @@ return {
 except Exception as e:
 print(f"AI outfit selection failed: {e}")
 
-# Fallback random
 tops = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "top"]
 bottoms = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "bottom"]
 shoes = [i for i, item in enumerate(wardrobe) if item.get("category", "").lower() == "shoes"]
@@ -448,3 +442,4 @@ return Path("terms.html").read_text(encoding="utf-8")
 if __name__ == "__main__":
 import uvicorn
 uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
