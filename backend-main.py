@@ -11,6 +11,7 @@ import random
 import re
 import requests
 from PIL import Image, ImageEnhance
+from rembg import remove, new_session
 
 app = FastAPI()
 
@@ -25,6 +26,9 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 REMOVE_BG_API_KEY = os.getenv("REMOVE_BG_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
+# Initialize rembg session ONCE at startup (much faster than per-request)
+rembg_session = new_session("u2netp")
+
 
 @app.get("/")
 async def root():
@@ -32,7 +36,7 @@ async def root():
         "status": "live",
         "service": "styligma-v2",
         "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item", "/privacy", "/terms"],
-        "rembg": False,
+        "rembg": True,
         "remove_bg": bool(REMOVE_BG_API_KEY),
         "claude": bool(ANTHROPIC_API_KEY),
     }
@@ -43,7 +47,7 @@ async def remove_background(file: UploadFile = File(...)):
     try:
         input_data = await file.read()
 
-        # Resize to max 1024px before sending (saves API credits + faster)
+        # Resize to max 1024px before processing (faster, less memory)
         img_input = Image.open(io.BytesIO(input_data))
         max_size = 1024
         if max(img_input.size) > max_size:
@@ -52,20 +56,11 @@ async def remove_background(file: UploadFile = File(...)):
             img_input.save(buf_resized, format="JPEG", quality=90)
             input_data = buf_resized.getvalue()
 
-        # Call remove.bg API
-        response = requests.post(
-            "https://api.remove.bg/v1.0/removebg",
-            files={"image_file": ("image.jpg", input_data, "image/jpeg")},
-            data={"size": "auto"},
-            headers={"X-Api-Key": REMOVE_BG_API_KEY},
-            timeout=30,
-        )
-
-        if response.status_code != 200:
-            return JSONResponse(status_code=500, content={"success": False, "error": f"remove.bg error: {response.text}"})
+        # Use rembg with the fast u2netp model (free, self-hosted)
+        output_data = remove(input_data, session=rembg_session)
 
         # Boost color saturation for vivid images
-        img = Image.open(io.BytesIO(response.content)).convert("RGBA")
+        img = Image.open(io.BytesIO(output_data)).convert("RGBA")
         r, g, b, a = img.split()
         rgb_img = Image.merge("RGB", (r, g, b))
 
@@ -84,7 +79,7 @@ async def remove_background(file: UploadFile = File(...)):
         return {
             "success": True,
             "image": f"data:image/png;base64,{base64_image}",
-            "method": "remove-bg-api",
+            "method": "rembg-u2netp",
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
