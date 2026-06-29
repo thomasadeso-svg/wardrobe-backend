@@ -9,6 +9,7 @@ import base64
 import json
 import random
 import re
+import hashlib
 import requests
 from PIL import Image, ImageEnhance
 from rembg import remove, new_session
@@ -26,8 +27,14 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 REMOVE_BG_API_KEY = os.getenv("REMOVE_BG_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# Initialize rembg session ONCE at startup (much faster than per-request)
+# Initialize rembg session ONCE at startup
 rembg_session = new_session("u2netp")
+
+# Simple in-memory cache for vacation list results (resets on Railway redeploy)
+vacation_cache = {}
+
+# Allowed activities for v1
+VALID_ACTIVITIES = {"beach", "dinner", "sightseeing", "nightlife", "hiking", "business", "casual", "workout"}
 
 
 @app.get("/")
@@ -35,10 +42,19 @@ async def root():
     return {
         "status": "live",
         "service": "styligma-v2",
-        "endpoints": ["/remove-background", "/analyze-clothing", "/generate-outfit", "/match-item", "/privacy", "/terms"],
+        "endpoints": [
+            "/remove-background",
+            "/analyze-clothing",
+            "/generate-outfit",
+            "/match-item",
+            "/vacation-list",
+            "/privacy",
+            "/terms",
+        ],
         "rembg": True,
         "remove_bg": bool(REMOVE_BG_API_KEY),
         "claude": bool(ANTHROPIC_API_KEY),
+        "vacation_cache_size": len(vacation_cache),
     }
 
 
@@ -47,7 +63,6 @@ async def remove_background(file: UploadFile = File(...)):
     try:
         input_data = await file.read()
 
-        # Resize to max 1024px before processing (faster, less memory)
         img_input = Image.open(io.BytesIO(input_data))
         max_size = 1024
         if max(img_input.size) > max_size:
@@ -56,10 +71,8 @@ async def remove_background(file: UploadFile = File(...)):
             img_input.save(buf_resized, format="JPEG", quality=90)
             input_data = buf_resized.getvalue()
 
-        # Use rembg with the fast u2netp model (free, self-hosted)
         output_data = remove(input_data, session=rembg_session)
 
-        # Boost color saturation for vivid images
         img = Image.open(io.BytesIO(output_data)).convert("RGBA")
         r, g, b, a = img.split()
         rgb_img = Image.merge("RGB", (r, g, b))
@@ -424,6 +437,233 @@ ONLY JSON, nothing else.""",
     }
 
 
+@app.post("/vacation-list")
+async def vacation_list(request: dict):
+    """
+    Generate a vacation packing list + daily outfits from the user's wardrobe.
+
+    Request body:
+    {
+      "wardrobe": [...],
+      "destination": "Barcelona",
+      "start_date": "2026-06-14",
+      "end_date": "2026-06-21",
+      "activities": ["beach", "dinner", "sightseeing", "casual"],
+      "weather": "warm",
+      "style_profile": {...}
+    }
+    """
+    wardrobe = request.get("wardrobe", [])
+    destination = request.get("destination", "").strip()
+    start_date = request.get("start_date", "").strip()
+    end_date = request.get("end_date", "").strip()
+    activities = request.get("activities", [])
+    weather = request.get("weather", "moderate")
+    style_profile = request.get("style_profile", None)
+
+    if len(wardrobe) < 5:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Wardrobe needs at least 5 items to plan a trip."},
+        )
+    if not destination:
+        return JSONResponse(status_code=400, content={"error": "Destination is required."})
+    if not start_date or not end_date:
+        return JSONResponse(status_code=400, content={"error": "Start and end dates are required."})
+
+    try:
+        from datetime import date
+        d1 = date.fromisoformat(start_date)
+        d2 = date.fromisoformat(end_date)
+        days = (d2 - d1).days + 1
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid date format. Use YYYY-MM-DD."})
+
+    if days < 1:
+        return JSONResponse(status_code=400, content={"error": "End date must be after start date."})
+    if days > 14:
+        return JSONResponse(status_code=400, content={"error": "Trips longer than 14 days aren't supported yet."})
+
+    normalized_activities = [a.lower().strip() for a in activities if isinstance(a, str)]
+    normalized_activities = [a for a in normalized_activities if a in VALID_ACTIVITIES]
+    if not normalized_activities:
+        normalized_activities = ["casual"]
+
+    # Cache key based on wardrobe signature + trip details
+    wardrobe_signature = "|".join(
+        f"{item.get('name', '')}-{item.get('category', '')}-{item.get('color', '')}"
+        for item in wardrobe
+    )
+    cache_payload = json.dumps({
+        "wardrobe": wardrobe_signature,
+        "destination": destination.lower(),
+        "start": start_date,
+        "end": end_date,
+        "activities": sorted(normalized_activities),
+        "weather": weather,
+    }, sort_keys=True)
+    cache_key = hashlib.sha256(cache_payload.encode("utf-8")).hexdigest()
+
+    if cache_key in vacation_cache:
+        cached = vacation_cache[cache_key].copy()
+        cached["from_cache"] = True
+        return cached
+
+    items_list = []
+    for i, item in enumerate(wardrobe):
+        items_list.append(
+            f"[{i}] {item.get('name', 'Item')} — {item.get('category', '?')}, "
+            f"Color: {item.get('color', '?')}, Style: {item.get('style', '?')}, "
+            f"Sub: {item.get('subcategory', '?')}, Season: {item.get('season', '?')}"
+        )
+    items_text = "\n".join(items_list)
+
+    profile_text = ""
+    if style_profile:
+        parts = []
+        if style_profile.get("vibe"):
+            parts.append(f"Style vibe: {style_profile['vibe']}")
+        if style_profile.get("colors"):
+            parts.append(f"Preferred colors: {', '.join(style_profile['colors'])}")
+        if style_profile.get("avoid"):
+            avoid_colors = [c for c in style_profile['avoid'] if c != 'none']
+            if avoid_colors:
+                parts.append(f"Colors to AVOID: {', '.join(avoid_colors)}")
+        if parts:
+            profile_text = "\n\nUSER STYLE PROFILE:\n" + "\n".join(f"- {p}" for p in parts)
+
+    activities_text = ", ".join(normalized_activities)
+
+    if not client:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Claude API not configured on the backend."},
+        )
+
+    try:
+        prompt = f"""You are an expert travel stylist for "Styligma ✧".
+
+The user is planning a trip and wants you to pack their suitcase using items from THEIR EXISTING WARDROBE.
+
+TRIP DETAILS:
+- Destination: {destination}
+- Dates: {start_date} → {end_date} ({days} days)
+- Weather: {weather}
+- Planned activities: {activities_text}
+{profile_text}
+
+THEIR WARDROBE:
+{items_text}
+
+TASK:
+1. Build a smart, minimal PACKING LIST from items in their wardrobe. Don't pack everything — pick versatile pieces that mix and match. Aim for roughly 8–15 items total depending on trip length and activities.
+2. Plan an OUTFIT FOR EACH DAY of the trip using only items from the packing list. Outfits should match the activity planned for that day. Vary outfits across days — don't repeat the same combo.
+3. Identify any MISSING ITEMS the user should consider bringing (e.g. "light rain jacket", "swimwear") — only mention items NOT in their wardrobe that they'd genuinely need.
+
+STYLING RULES:
+- Match outfits to the weather and activity
+- Color harmony across the packed items so they mix and match
+- For multi-day trips, re-wear bottoms/outerwear but vary tops
+- Beach day = lighter/swim-friendly; Dinner = elevated; Business = formal; Hiking = sporty
+- Each daily outfit needs at minimum a top and a bottom (or a dress)
+
+Return ONLY this JSON, nothing else:
+{{
+  "trip": {{
+    "destination": "{destination}",
+    "days": {days},
+    "weather_summary": "Short weather description"
+  }},
+  "packing_list": {{
+    "tops": [item index numbers],
+    "bottoms": [item index numbers],
+    "shoes": [item index numbers],
+    "outerwear": [item index numbers],
+    "accessories": [item index numbers]
+  }},
+  "daily_outfits": [
+    {{
+      "day": 1,
+      "activity": "main activity for this day",
+      "item_indices": [list of indices from the packing list],
+      "note": "Short styling note"
+    }}
+  ],
+  "missing_items": ["light jacket for evenings", "..."],
+  "explanation": "Why this packing list works for this trip — 1-2 sentences"
+}}
+
+IMPORTANT:
+- item indices must be valid numbers from the wardrobe list above
+- daily_outfits must have exactly {days} entries
+- only suggest items in missing_items that the user genuinely needs and doesn't already have
+- ONLY JSON, no other text"""
+
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        response_text = message.content[0].text.strip()
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not match:
+            raise ValueError("Claude didn't return valid JSON")
+
+        result = json.loads(match.group(0))
+
+        def clean_indices(arr):
+            return [i for i in (arr or []) if isinstance(i, int) and 0 <= i < len(wardrobe)]
+
+        packing = result.get("packing_list", {})
+        cleaned_packing = {
+            "tops": clean_indices(packing.get("tops")),
+            "bottoms": clean_indices(packing.get("bottoms")),
+            "shoes": clean_indices(packing.get("shoes")),
+            "outerwear": clean_indices(packing.get("outerwear")),
+            "accessories": clean_indices(packing.get("accessories")),
+        }
+
+        all_packed = set()
+        for cat_list in cleaned_packing.values():
+            all_packed.update(cat_list)
+
+        cleaned_outfits = []
+        for outfit in result.get("daily_outfits", []):
+            valid_idx = [i for i in clean_indices(outfit.get("item_indices")) if i in all_packed]
+            if valid_idx:
+                cleaned_outfits.append({
+                    "day": outfit.get("day"),
+                    "activity": outfit.get("activity", ""),
+                    "item_indices": valid_idx,
+                    "note": outfit.get("note", ""),
+                })
+
+        final_result = {
+            "trip": result.get("trip", {"destination": destination, "days": days, "weather_summary": ""}),
+            "packing_list": cleaned_packing,
+            "daily_outfits": cleaned_outfits,
+            "missing_items": result.get("missing_items", []),
+            "explanation": result.get("explanation", ""),
+            "from_cache": False,
+        }
+
+        if len(vacation_cache) > 200:
+            vacation_cache.pop(next(iter(vacation_cache)))
+        vacation_cache[cache_key] = final_result
+
+        return final_result
+
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Couldn't parse AI response. Try again."},
+        )
+    except Exception as e:
+        print(f"Vacation list generation failed: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     return Path("privacy.html").read_text(encoding="utf-8")
@@ -437,3 +677,5 @@ async def terms():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
+
