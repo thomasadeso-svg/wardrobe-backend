@@ -19,7 +19,7 @@
 <body>
     <div class="container">
         <h1>Privacy Policy</h1>
-        <p class="subtitle">Datenschutzerklärung · Last updated: February 2026</p>
+        <p class="subtitle">Datenschutzerklärung · Last updated: June 2026</p>
 
         <h2>1. Overview</h2>
         <p>Styligma ("we", "our", "the app") takes your privacy seriously. This policy explains what data we collect, how we use it, and your rights regarding your personal data.</p>
@@ -28,7 +28,7 @@
         <p><strong>Photos you take:</strong> When you photograph a clothing item, the image is sent to our server for AI processing (background removal and clothing analysis). Images are processed in real-time and are NOT stored on our servers. They are deleted immediately after processing.</p>
         <p><strong>Wardrobe data:</strong> Your clothing items (names, categories, colors, styles) and processed images are stored locally on your device only. We do not have access to this data.</p>
         <p><strong>No account required:</strong> We do not collect your name, email address, or any personal identification information.</p>
-        <p><strong>No tracking:</strong> We do not use analytics, cookies, or tracking tools. We do not track your usage behavior.</p>
+        <p><strong>Anonymous analytics:</strong> We use PostHog (hosted in the EU) to collect anonymous usage data such as which screens are opened, which features are used, and how long sessions last. This data is NOT linked to your identity, NOT used for advertising, and NOT shared with any third party other than our analytics provider. We use it solely to understand how Styligma is used and improve the app.</p>
         <p><strong>Location data:</strong> If you enable weather-based outfit suggestions, your approximate location is used solely to fetch local weather data. Location is never stored or shared.</p>
 
         <h2>3. AI Processing</h2>
@@ -38,13 +38,17 @@
         <p>Styligma Pro subscriptions are processed through Apple's App Store or Google Play Store. We do not directly collect or store any payment information. All billing is handled by Apple or Google according to their respective privacy policies.</p>
 
         <h2>5. Data Storage</h2>
-        <p>All wardrobe data is stored exclusively on your device using local storage. We have no access to your data. If you delete the app, all data is permanently removed.</p>
+        <p>All wardrobe data is stored exclusively on your device using local storage. We have no access to your data. If you delete the app, all data is permanently removed. Anonymous analytics data is stored by PostHog on EU servers and is retained according to PostHog's data retention policy.</p>
 
-        <h2>6. Data Sharing</h2>
-        <p>We do not sell, share, or transfer your personal data to third parties. The only external service that temporarily receives your clothing photos for processing is our backend server and the Anthropic AI API.</p>
+        <h2>6. Third-Party Services</h2>
+        <p>The following third-party services process limited data on our behalf:</p>
+        <p><strong>Anthropic Claude AI:</strong> Receives clothing photographs for analysis. No personal data is shared.</p>
+        <p><strong>PostHog (EU hosted):</strong> Receives anonymous usage events (taps, screens visited, feature usage) to help us improve the app. No personal data is shared.</p>
+        <p><strong>Open-Meteo:</strong> Receives approximate location coordinates when weather detection is used. No personal data is shared.</p>
+        <p>We do not sell, share, or transfer your personal data to any other third parties.</p>
 
         <h2>7. Your Rights (GDPR / DSGVO)</h2>
-        <p>Under the GDPR/DSGVO, you have the right to access, delete, and export your data. Since all data is stored locally on your device, you have full control at all times. Use "Delete All Wardrobe Data" in Settings to erase everything.</p>
+        <p>Under the GDPR/DSGVO, you have the right to access, delete, and export your data. Since all wardrobe data is stored locally on your device, you have full control at all times. Use "Delete All Wardrobe Data" in Settings to erase everything. For analytics data deletion requests, contact us at the email below.</p>
 
         <h2>8. Children's Privacy</h2>
         <p>Styligma is not directed at children under 13. We do not knowingly collect data from children.</p>
@@ -58,7 +62,7 @@
             Thomas Adeso<br>
             Goethestrasse 11<br>
             69181 Leimen, Germany<br>
-            Email: t.adeso@icloud.com
+            Email: styligma.app@outlook.com
         </p>
 
         <div class="footer">
