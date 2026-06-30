@@ -534,6 +534,35 @@ async def vacation_list(request: dict):
 
     activities_text = ", ".join(normalized_activities)
 
+    # Compute minimum packing counts based on trip length
+    min_tops = max(3, (days + 1) // 2)  # ceil(days/2), at least 3
+    min_bottoms = max(2, (days + 3) // 4)  # ceil(days/4), at least 2
+
+    # Check if walking-friendly shoes are required
+    needs_walking_shoes = any(a in normalized_activities for a in ["sightseeing", "casual", "hiking", "workout"])
+    needs_dressy_shoes = any(a in normalized_activities for a in ["dinner", "nightlife", "business"])
+
+    if needs_walking_shoes and needs_dressy_shoes:
+        shoe_guidance = "Pack BOTH comfortable walking shoes (sneakers, flats, loafers, boots) AND one dressier pair (heels, dress shoes, or smart boots) - the trip has both walking-heavy and dressy activities."
+    elif needs_walking_shoes:
+        shoe_guidance = "Pack at least 1 pair of COMFORTABLE WALKING shoes (sneakers, flats, loafers, or comfortable boots). Do NOT pack only heels or dress shoes - the activities require walking comfort."
+    elif needs_dressy_shoes:
+        shoe_guidance = "Pack dressier shoes appropriate for dinner/nightlife/business (heels, dress boots, loafers)."
+    else:
+        shoe_guidance = "Pack at least 1 versatile pair of shoes that suits the activities."
+
+    # Outerwear guidance by weather
+    if weather in ["hot", "warm"]:
+        outerwear_guidance = "0-1 light outerwear pieces (light cardigan or linen blazer only if useful for evening)"
+    elif weather == "moderate":
+        outerwear_guidance = "1 outerwear piece (light jacket or blazer)"
+    elif weather == "cool":
+        outerwear_guidance = "1-2 outerwear pieces (jacket + warmer layer)"
+    elif weather == "cold":
+        outerwear_guidance = "2 outerwear pieces (warm coat + extra layer like a sweater or vest)"
+    else:
+        outerwear_guidance = "0-1 outerwear pieces depending on need"
+
     if not client:
         return JSONResponse(
             status_code=500,
@@ -556,16 +585,29 @@ THEIR WARDROBE:
 {items_text}
 
 TASK:
-1. Build a smart, minimal PACKING LIST from items in their wardrobe. Don't pack everything — pick versatile pieces that mix and match. Aim for roughly 8–15 items total depending on trip length and activities.
-2. Plan an OUTFIT FOR EACH DAY of the trip using only items from the packing list. Outfits should match the activity planned for that day. Vary outfits across days — don't repeat the same combo.
-3. Identify any MISSING ITEMS the user should consider bringing (e.g. "light rain jacket", "swimwear") — only mention items NOT in their wardrobe that they'd genuinely need.
+1. Build a PACKING LIST from items in their wardrobe following the MINIMUM COUNTS below. Pick versatile pieces that mix and match - don't just pack everything.
+2. Plan an OUTFIT FOR EACH DAY of the trip using only items from the packing list. Outfits should match the activity planned for that day. Vary outfits - don't repeat the same combo across days.
+3. Identify any MISSING ITEMS the user should consider bringing - only items NOT in their wardrobe that they'd genuinely need.
+
+PACKING MINIMUMS (NON-NEGOTIABLE for a {days}-day trip):
+- Tops: AT LEAST {min_tops} (more if dressier activities require variety)
+- Bottoms: AT LEAST {min_bottoms} (jeans, trousers, shorts, skirts - bottoms can be re-worn across days)
+- Shoes: {shoe_guidance}
+- Outerwear: {outerwear_guidance}
+- Accessories: 1-4 versatile pieces (bag, jewelry, sunglasses, hat, scarf)
+
+HARD RULES - NEVER VIOLATE:
+- NEVER pack fewer than {min_tops} tops or {min_bottoms} bottoms for this trip
+- For sightseeing or casual activities: ALWAYS include comfortable walking shoes - heels-only is WRONG for sightseeing
+- For beach activities: include items appropriate for warm weather and water (or flag swimwear as missing)
+- For business/dinner: include a polished/elevated piece (blazer, dress, or similar)
+- Each daily outfit needs at minimum a top and a bottom (or a full dress)
 
 STYLING RULES:
-- Match outfits to the weather and activity
-- Color harmony across the packed items so they mix and match
-- For multi-day trips, re-wear bottoms/outerwear but vary tops
-- Beach day = lighter/swim-friendly; Dinner = elevated; Business = formal; Hiking = sporty
-- Each daily outfit needs at minimum a top and a bottom (or a dress)
+- Color harmony across packed items so they mix and match (stick to 1 cohesive palette + 1-2 neutrals)
+- Re-wear bottoms and outerwear across days while VARYING TOPS - that's how real packing works
+- Match outfits to the planned activity for that day
+- Beach day = lightweight/swim-friendly; Dinner = elevated; Business = formal; Hiking = sporty; Sightseeing = comfortable shoes + breathable layers
 
 Return ONLY this JSON, nothing else:
 {{
@@ -589,14 +631,14 @@ Return ONLY this JSON, nothing else:
       "note": "Short styling note"
     }}
   ],
-  "missing_items": ["light jacket for evenings", "..."],
-  "explanation": "Why this packing list works for this trip — 1-2 sentences"
+  "missing_items": ["light rain jacket", "swimwear if beach", "..."],
+  "explanation": "Why this packing list works for this trip - 1-2 sentences"
 }}
 
 IMPORTANT:
 - item indices must be valid numbers from the wardrobe list above
 - daily_outfits must have exactly {days} entries
-- only suggest items in missing_items that the user genuinely needs and doesn't already have
+- only suggest missing_items the user genuinely needs and doesn't already have
 - ONLY JSON, no other text"""
 
         message = client.messages.create(
@@ -677,5 +719,3 @@ async def terms():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
-
