@@ -27,13 +27,10 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 REMOVE_BG_API_KEY = os.getenv("REMOVE_BG_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# Initialize rembg session ONCE at startup
 rembg_session = new_session("u2netp")
 
-# Simple in-memory cache for vacation list results (resets on Railway redeploy)
 vacation_cache = {}
 
-# Allowed activities for v1
 VALID_ACTIVITIES = {"beach", "dinner", "sightseeing", "nightlife", "hiking", "business", "casual", "workout"}
 
 
@@ -188,12 +185,30 @@ async def generate_outfit(request: dict):
         )
     items_text = "\n".join(items_list)
 
+    # Variety tracking (id-based). previous_outfits arrives as a list of
+    # lists of wardrobe item IDs (stable identity, not array positions --
+    # positions shift whenever items are added/removed, which used to make
+    # this comparison silently wrong). Build id -> current-index map for
+    # this request, then translate each historical outfit into (a) a
+    # human-readable avoid line for the prompt and (b) a set of current
+    # indices we can compare Claude's answer against afterward.
+    id_to_index = {item.get("id"): i for i, item in enumerate(wardrobe) if item.get("id")}
+
+    previous_index_sets = []
+    avoid_lines = []
+    for prev_ids in previous_outfits[-5:]:
+        current_indices = sorted(id_to_index[pid] for pid in prev_ids if pid in id_to_index)
+        if len(current_indices) < 2:
+            continue
+        previous_index_sets.append(set(current_indices))
+        names = [wardrobe[i].get("name", "Item") for i in current_indices]
+        avoid_lines.append(", ".join(names))
+
     avoid_text = ""
-    if previous_outfits:
-        avoid_lines = []
-        for prev in previous_outfits[-5:]:
-            avoid_lines.append(str(prev))
-        avoid_text = f"\n\nAVOID these combinations (already shown):\n" + "\n".join(avoid_lines)
+    if avoid_lines:
+        avoid_text = "\n\nAVOID these exact combinations (already shown recently):\n" + "\n".join(
+            f"- {line}" for line in avoid_lines
+        )
 
     profile_text = ""
     if style_profile:
@@ -211,14 +226,8 @@ async def generate_outfit(request: dict):
         if parts:
             profile_text = "\n\nUSER STYLE PROFILE (personalize to match):\n" + "\n".join(f"- {p}" for p in parts)
 
-    if client:
-        try:
-            pick_response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=500,
-                messages=[{
-                    "role": "user",
-                    "content": f"""You are an expert fashion stylist for "Styligma ✧".
+    def ask_claude_for_outfit(extra_instruction: str = "") -> dict:
+        prompt = f"""You are an expert fashion stylist for "Styligma ✧".
 
 WARDROBE:
 {items_text}
@@ -247,6 +256,7 @@ ABSOLUTE RULES:
 VARIETY RULES:
 - DO NOT repeat previous combinations
 - Rotate through available items
+{extra_instruction}
 
 STYLE RULES:
 - Focus on COLOR HARMONY: complementary, analogous, or monochrome palettes
@@ -261,17 +271,22 @@ Return ONLY JSON:
   "styling_tip": "One specific actionable tip for wearing this outfit"
 }}
 
-selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""",
-                }],
-            )
+selected_indices = exact index numbers from the list. ONLY JSON, nothing else."""
 
-            pick_text = pick_response.content[0].text.strip()
+        pick_response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        pick_text = pick_response.content[0].text.strip()
+        match = re.search(r'\{.*\}', pick_text, re.DOTALL)
+        if not match:
+            raise ValueError("Claude didn't return valid JSON")
+        return json.loads(match.group(0))
 
-            match = re.search(r'\{.*\}', pick_text, re.DOTALL)
-            if not match:
-                raise ValueError("Claude didn't return valid JSON")
-
-            pick_data = json.loads(match.group(0))
+    if client:
+        try:
+            pick_data = ask_claude_for_outfit()
             indices = pick_data.get("selected_indices", [])
             valid_indices = [i for i in indices if 0 <= i < len(wardrobe)]
 
@@ -287,6 +302,35 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
             deduplicated.sort(key=lambda x: category_order.get(wardrobe[x].get("category", "unknown").lower().strip(), 99))
 
             valid_indices = deduplicated
+
+            # Server-side repeat check. The prompt ASKS Claude not to repeat,
+            # but nothing enforced it before. If the result is an exact match
+            # (same set of items) as a recent outfit, retry once with a
+            # sharper instruction instead of trusting the prompt blindly.
+            if valid_indices and previous_index_sets and set(valid_indices) in previous_index_sets:
+                try:
+                    retry_names = [wardrobe[i].get("name", "Item") for i in valid_indices]
+                    extra = (
+                        f"\nIMPORTANT: You just suggested this exact combination again "
+                        f"({', '.join(retry_names)}). Pick a genuinely DIFFERENT set of items this time."
+                    )
+                    retry_data = ask_claude_for_outfit(extra_instruction=extra)
+                    retry_indices = [i for i in retry_data.get("selected_indices", []) if 0 <= i < len(wardrobe)]
+
+                    seen_categories = set()
+                    retry_dedup = []
+                    for i in retry_indices:
+                        cat = wardrobe[i].get("category", "unknown").lower().strip()
+                        if cat not in seen_categories:
+                            seen_categories.add(cat)
+                            retry_dedup.append(i)
+                    retry_dedup.sort(key=lambda x: category_order.get(wardrobe[x].get("category", "unknown").lower().strip(), 99))
+
+                    if retry_dedup and set(retry_dedup) not in previous_index_sets:
+                        valid_indices = retry_dedup
+                        pick_data = retry_data
+                except Exception as retry_err:
+                    print(f"Retry for repeated outfit failed, keeping original: {retry_err}")
 
             if valid_indices:
                 return {
@@ -308,11 +352,29 @@ selected_indices = exact index numbers from the list. ONLY JSON, nothing else.""
     for lst in [tops, bottoms, shoes, outerwear]:
         random.shuffle(lst)
 
-    selected = [{"item_index": tops[0]}, {"item_index": bottoms[0]}]
-    if shoes:
-        selected.append({"item_index": shoes[0]})
-    if outerwear and weather in ["cold", "moderate"]:
-        selected.insert(0, {"item_index": outerwear[0]})
+    # Fallback path (Claude API unavailable): at least avoid exact repeats
+    # of recent combos where possible by trying a few shuffled candidates.
+    def build_candidate():
+        cand = [tops[0], bottoms[0]]
+        if shoes:
+            cand.append(shoes[0])
+        if outerwear and weather in ["cold", "moderate"]:
+            cand.append(outerwear[0])
+        return cand
+
+    candidate = build_candidate()
+    attempts = 0
+    while previous_index_sets and set(candidate) in previous_index_sets and attempts < 5:
+        random.shuffle(tops)
+        random.shuffle(bottoms)
+        if shoes:
+            random.shuffle(shoes)
+        if outerwear:
+            random.shuffle(outerwear)
+        candidate = build_candidate()
+        attempts += 1
+
+    selected = [{"item_index": i} for i in candidate]
 
     return {
         "outfit": selected,
@@ -439,20 +501,6 @@ ONLY JSON, nothing else.""",
 
 @app.post("/vacation-list")
 async def vacation_list(request: dict):
-    """
-    Generate a vacation packing list + daily outfits from the user's wardrobe.
-
-    Request body:
-    {
-      "wardrobe": [...],
-      "destination": "Barcelona",
-      "start_date": "2026-06-14",
-      "end_date": "2026-06-21",
-      "activities": ["beach", "dinner", "sightseeing", "casual"],
-      "weather": "warm",
-      "style_profile": {...}
-    }
-    """
     wardrobe = request.get("wardrobe", [])
     destination = request.get("destination", "").strip()
     start_date = request.get("start_date", "").strip()
@@ -489,7 +537,6 @@ async def vacation_list(request: dict):
     if not normalized_activities:
         normalized_activities = ["casual"]
 
-    # Cache key based on wardrobe signature + trip details
     wardrobe_signature = "|".join(
         f"{item.get('name', '')}-{item.get('category', '')}-{item.get('color', '')}"
         for item in wardrobe
@@ -534,11 +581,9 @@ async def vacation_list(request: dict):
 
     activities_text = ", ".join(normalized_activities)
 
-    # Compute minimum packing counts based on trip length
-    min_tops = max(3, (days + 1) // 2)  # ceil(days/2), at least 3
-    min_bottoms = max(2, (days + 3) // 4)  # ceil(days/4), at least 2
+    min_tops = max(3, (days + 1) // 2)
+    min_bottoms = max(2, (days + 3) // 4)
 
-    # Check if walking-friendly shoes are required
     needs_walking_shoes = any(a in normalized_activities for a in ["sightseeing", "casual", "hiking", "workout"])
     needs_dressy_shoes = any(a in normalized_activities for a in ["dinner", "nightlife", "business"])
 
@@ -551,7 +596,6 @@ async def vacation_list(request: dict):
     else:
         shoe_guidance = "Pack at least 1 versatile pair of shoes that suits the activities."
 
-    # Outerwear guidance by weather
     if weather in ["hot", "warm"]:
         outerwear_guidance = "0-1 light outerwear pieces (light cardigan or linen blazer only if useful for evening)"
     elif weather == "moderate":
