@@ -13,8 +13,11 @@ import hashlib
 import requests
 from PIL import Image, ImageEnhance
 from rembg import remove, new_session
+from video_scan import router as video_scan_router
 
 app = FastAPI()
+
+app.include_router(video_scan_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -763,3 +766,4 @@ async def terms():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
