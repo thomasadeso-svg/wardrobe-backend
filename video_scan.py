@@ -1,45 +1,3 @@
-"""
-Video Wardrobe Scan — backend module for Styligma
-
-Feature: user films a pan across their closet; we extract frames, dedupe
-near-identical/repeated garments, remove backgrounds, classify each item
-with Claude vision, and return a review list for the app to confirm before
-anything is added to the wardrobe.
-
-ASYNC JOB MODEL: POST /scan-video returns a job_id immediately (202) and
-processes in the background — the app doesn't block waiting for results,
-and the user can record more scans while an earlier one is still running.
-Completion is signaled via an Expo push notification (if a push_token was
-supplied) with GET /scan-status/{job_id} as a polling fallback.
-
-MERGE INSTRUCTIONS:
-1. Add this router to backend-main.py:
-     from video_scan import router as video_scan_router
-     app.include_router(video_scan_router)
-2. Add new dependencies to requirements.txt:
-     opencv-python-headless
-     imagehash
-     httpx
-     Pillow  (already present via rembg dependency, but pin explicitly)
-3. Railway build: opencv-python-headless avoids needing system GUI libs
-   that opencv-python requires and that Railway's build image lacks.
-
-COST / SAFETY GUARDRAILS (do not remove without reconsidering):
-- MAX_VIDEO_SECONDS caps processing time and Claude API spend per scan.
-- MAX_ITEMS_RETURNED caps how many items get sent to the frontend, since
-  a long slow pan could otherwise generate 40+ near-duplicate candidates.
-- Frames are deduped BEFORE hitting Claude vision (not after), since the
-  Claude call is the expensive step — hashing is done locally and free.
-- Per-IP rate limit (5 scans / 24h) is a best-effort abuse deterrent —
-  the app has no accounts, so this is not a real security boundary, just
-  a cheap tripwire against scripted abuse. The actual free-tier cap
-  (1 free scan, then Pro) lives client-side in WardrobeStore.
-- Items are processed CONCURRENTLY (up to MAX_CONCURRENT_ITEM_PROCESSING
-  at once via asyncio + a semaphore), not one at a time. A 20-item scan
-  went from ~80s sequential to roughly however long the slowest single
-  item takes (~10-15s). Raise the concurrency cap cautiously — it's
-  bounded by Claude's rate limits and Railway's CPU, not just app logic.
-"""
 
 import io
 import os
@@ -65,11 +23,22 @@ router = APIRouter()
 
 # ── Guardrails ──────────────────────────────────────────────────────────
 MAX_VIDEO_SECONDS = 20
-FRAME_SAMPLE_INTERVAL_SEC = 0.5   # check a candidate frame twice a second
-DEDUP_HASH_THRESHOLD = 8          # lower = stricter dedup (0-64 scale, phash)
+FRAME_SAMPLE_INTERVAL_SEC = 0.5
+
+# Stage 1: cheap whole-frame dedupe before expensive AI processing.
+FRAME_DEDUP_HASH_THRESHOLD = 8
+
+# Stage 2: stronger dedupe on the normalized garment cutout itself.
+GARMENT_DEDUP_HASH_THRESHOLD = 12
+
 MAX_ITEMS_RETURNED = 20
-MIN_FRAME_SHARPNESS = 40.0        # rejects motion-blurred frames (Laplacian variance)
-MAX_CONCURRENT_ITEM_PROCESSING = 5  # cap parallel rembg+Claude calls — protects Claude rate limits and Railway CPU
+MIN_FRAME_SHARPNESS = 40.0
+MAX_CONCURRENT_ITEM_PROCESSING = 5
+
+# Final wardrobe image normalization.
+NORMALIZED_CANVAS_SIZE = 900
+NORMALIZED_PADDING = 90
+MIN_ALPHA_BBOX_RATIO = 0.08
 
 # ── Abuse guard ──────────────────────────────────────────────────────────
 # The app has no accounts (by design — see privacy policy), so we can't do
@@ -180,8 +149,18 @@ def _sharpness(frame) -> float:
 
 
 def _extract_candidate_frames(video_path: str) -> List["Image.Image"]:
-    """Pull frames at a fixed interval, skip blurry ones. Returns PIL images."""
+    """
+    Pull frames at a fixed interval, apply phone-video orientation metadata
+    when OpenCV exposes it, and skip blurry frames.
+    """
     cap = cv2.VideoCapture(video_path)
+
+    try:
+        if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+            cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
+    except Exception:
+        pass
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     frame_interval = max(1, int(fps * FRAME_SAMPLE_INTERVAL_SEC))
 
@@ -195,69 +174,177 @@ def _extract_candidate_frames(video_path: str) -> List["Image.Image"]:
 
     frames = []
     idx = 0
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        if idx % frame_interval == 0:
-            if _sharpness(frame) >= MIN_FRAME_SHARPNESS:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(rgb))
+
+        if idx % frame_interval == 0 and _sharpness(frame) >= MIN_FRAME_SHARPNESS:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(rgb))
+
         idx += 1
+
     cap.release()
     return frames
 
-
 def _dedupe_frames(frames: List["Image.Image"]) -> List["Image.Image"]:
     """
-    Perceptual-hash dedup. A slow pan produces many frames of the SAME
-    garment — we only want to keep one representative frame per distinct
-    item. This runs before the expensive Claude call, not after.
+    Cheap first-pass dedupe on the complete video frame.
+
+    This only prevents obviously repeated neighboring frames from reaching
+    Claude. A second garment-level dedupe runs later on the actual cutout.
     """
     kept = []
     kept_hashes = []
+
     for img in frames:
         h = imagehash.phash(img)
-        if all(h - kh > DEDUP_HASH_THRESHOLD for kh in kept_hashes):
+
+        if all(h - kh > FRAME_DEDUP_HASH_THRESHOLD for kh in kept_hashes):
             kept.append(img)
             kept_hashes.append(h)
+
         if len(kept) >= MAX_ITEMS_RETURNED:
             break
-    return kept
 
+    return kept
 
 def _remove_background(img: "Image.Image") -> "Image.Image":
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     result_bytes = rembg_remove(buf.getvalue())
-    return Image.open(io.BytesIO(result_bytes))
+    return Image.open(io.BytesIO(result_bytes)).convert("RGBA")
 
+
+def _normalize_cutout(img: "Image.Image") -> Optional["Image.Image"]:
+    """
+    Convert a background-removed result into a clean wardrobe asset.
+
+    We only crop, scale and center the REAL detected garment. We do not
+    generate a fake front-facing view, because that could alter the item.
+    """
+    rgba = img.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    bbox = alpha.getbbox()
+
+    if not bbox:
+        return None
+
+    left, top, right, bottom = bbox
+    garment_w = max(1, right - left)
+    garment_h = max(1, bottom - top)
+    bbox_ratio = (garment_w * garment_h) / max(1, rgba.width * rgba.height)
+
+    if bbox_ratio < MIN_ALPHA_BBOX_RATIO:
+        return None
+
+    cropped = rgba.crop(bbox)
+
+    inner_size = NORMALIZED_CANVAS_SIZE - (NORMALIZED_PADDING * 2)
+    scale = min(inner_size / cropped.width, inner_size / cropped.height)
+
+    new_w = max(1, int(cropped.width * scale))
+    new_h = max(1, int(cropped.height * scale))
+    cropped = cropped.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    canvas = Image.new(
+        "RGBA",
+        (NORMALIZED_CANVAS_SIZE, NORMALIZED_CANVAS_SIZE),
+        (255, 255, 255, 0),
+    )
+
+    x = (NORMALIZED_CANVAS_SIZE - new_w) // 2
+    y = (NORMALIZED_CANVAS_SIZE - new_h) // 2
+    canvas.alpha_composite(cropped, (x, y))
+
+    return canvas
+
+
+def _cutout_quality_score(img: "Image.Image") -> float:
+    """
+    Score a normalized cutout so duplicate groups keep their best frame.
+    Higher = sharper and more useful.
+    """
+    rgba = img.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    bbox = alpha.getbbox()
+
+    if not bbox:
+        return 0.0
+
+    rgb = Image.new("RGB", rgba.size, "white")
+    rgb.paste(rgba.convert("RGB"), mask=alpha)
+
+    import numpy as np
+    arr = cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
+    sharp = _sharpness(arr)
+
+    left, top, right, bottom = bbox
+    fill_ratio = ((right - left) * (bottom - top)) / max(1, rgba.width * rgba.height)
+
+    return float(sharp) + (fill_ratio * 500.0)
+
+
+def _same_garment_metadata(a: DetectedItem, b: DetectedItem) -> bool:
+    """
+    Conservative identity check used before garment-image hash comparison.
+    """
+    a_cat = (a.category or "").strip().lower()
+    b_cat = (b.category or "").strip().lower()
+    a_color = (a.color or "").strip().lower()
+    b_color = (b.color or "").strip().lower()
+
+    return a_cat == b_cat and (not a_color or not b_color or a_color == b_color)
+
+
+def _garment_hash_threshold(a: DetectedItem, b: DetectedItem) -> int:
+    """
+    If Claude agrees on subcategory we can dedupe a little more aggressively.
+    If labels differ, require a much closer visual match.
+    """
+    a_sub = (a.subcategory or "").strip().lower()
+    b_sub = (b.subcategory or "").strip().lower()
+
+    if a_sub and b_sub and a_sub == b_sub:
+        return GARMENT_DEDUP_HASH_THRESHOLD
+
+    return 7
 
 def _classify_with_claude(img: "Image.Image") -> dict:
     """
-    Same classification contract as the existing single-photo add flow —
-    keeps WardrobeItem fields consistent whether an item came from a
-    single photo or a video scan.
+    Strictly validate ONE garment candidate and classify it.
+
+    Important: rembg can still leave several overlapping clothes in one
+    cutout, so Claude acts as a quality gate instead of forcing every frame
+    into the wardrobe.
     """
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     img_b64 = base64.b64encode(buf.getvalue()).decode()
 
     prompt = (
-        "You are classifying a single clothing item cropped from a wardrobe scan video. "
-        "The background has been removed. Respond with ONLY valid JSON, no markdown, no preamble:\n"
+        "You are validating ONE garment candidate extracted from a wardrobe scan video. "
+        "Be strict. A candidate is usable only if ONE dominant wearable fashion item is "
+        "clearly visible and recognizable. Reject it when: several similarly dominant "
+        "garments overlap, the garment is heavily cut off, it is mostly closet/background, "
+        "the cutout is badly distorted, or it is too blurry/ambiguous. "
+        "A hanger attached to one clear garment is okay. "
+        "Respond with ONLY valid JSON, no markdown, no preamble:\n"
         "{\n"
+        '  "usable": true,\n'
         '  "category": "top|bottom|dress|shoes|outerwear|accessory",\n'
         '  "subcategory": "short specific type, e.g. blazer, jeans, sneakers",\n'
         '  "color": "primary color name",\n'
         '  "colors": ["array", "of", "all", "visible", "colors"],\n'
         '  "style": "casual|formal|sporty|elegant|streetwear",\n'
-        '  "season": ["spring","summer","fall","winter"] (all seasons this item suits),\n'
+        '  "season": ["spring","summer","fall","winter"],\n'
         '  "fabric_guess": "best guess at material",\n'
-        '  "confidence": "low|medium|high" (low if item is unclear, cropped oddly, or ambiguous)\n'
+        '  "confidence": "low|medium|high"\n'
         "}\n"
-        "If the image does not contain a clear clothing item (e.g. it's a wall, hanger only, "
-        'blurred nothing), respond with {"category": null} instead.'
+        'If unusable, respond exactly like {"usable": false, "category": null}. '
+        "Do not force a classification."
     )
 
     response = claude_client.messages.create(
@@ -266,7 +353,14 @@ def _classify_with_claude(img: "Image.Image") -> dict:
         messages=[{
             "role": "user",
             "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": img_b64,
+                    },
+                },
                 {"type": "text", "text": prompt},
             ],
         }],
@@ -274,10 +368,11 @@ def _classify_with_claude(img: "Image.Image") -> dict:
 
     text = response.content[0].text.strip()
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return {"category": None}
+        return {"usable": False, "category": None}
 
 
 @router.post("/scan-photo", response_model=DetectedItem)
@@ -300,16 +395,24 @@ async def scan_photo(request: Request, file: UploadFile = File(...)):
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
     cutout = _remove_background(img)
-    classification = _classify_with_claude(cutout)
+    normalized = _normalize_cutout(cutout)
 
-    if not classification.get("category"):
+    if normalized is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Couldn't isolate a clear clothing item in this photo.",
+        )
+
+    classification = _classify_with_claude(normalized)
+
+    if classification.get("usable") is False or not classification.get("category"):
         raise HTTPException(
             status_code=422,
             detail="Couldn't identify a clothing item in this photo. Try a clearer, closer shot.",
         )
 
     buf = io.BytesIO()
-    cutout.save(buf, format="PNG")
+    normalized.save(buf, format="PNG")
     return DetectedItem(
         temp_id="photo_0",
         image_base64=base64.b64encode(buf.getvalue()).decode(),
@@ -325,23 +428,28 @@ async def scan_photo(request: Request, file: UploadFile = File(...)):
     )
 
 
-def _process_single_frame_sync(frame: "Image.Image", temp_id: str) -> Optional[DetectedItem]:
+def _process_single_frame_sync(frame: "Image.Image", temp_id: str) -> Optional[dict]:
     """
-    Blocking work for ONE detected item: background removal + Claude
-    classification. Runs inside a thread (via asyncio.to_thread) so
-    multiple items can be processed concurrently instead of one at a
-    time — this is what took a 20-item scan from ~80s down to roughly
-    however long the slowest single item takes.
+    Process one frame into a normalized garment candidate.
+
+    We retain the PIL cutout and its hash/quality score so a second pass can
+    collapse repeated views of the same garment and keep the best one.
     """
     cutout = _remove_background(frame)
-    classification = _classify_with_claude(cutout)
+    normalized = _normalize_cutout(cutout)
 
-    if not classification.get("category"):
+    if normalized is None:
+        return None
+
+    classification = _classify_with_claude(normalized)
+
+    if classification.get("usable") is False or not classification.get("category"):
         return None
 
     buf = io.BytesIO()
-    cutout.save(buf, format="PNG")
-    return DetectedItem(
+    normalized.save(buf, format="PNG")
+
+    item = DetectedItem(
         temp_id=temp_id,
         image_base64=base64.b64encode(buf.getvalue()).decode(),
         category=classification.get("category"),
@@ -351,17 +459,23 @@ def _process_single_frame_sync(frame: "Image.Image", temp_id: str) -> Optional[D
         style=classification.get("style"),
         season=classification.get("season"),
         fabric_guess=classification.get("fabric_guess"),
-        name=classification.get("name") or f"{classification.get('color','')} {classification.get('subcategory','Item')}".strip(),
+        name=classification.get("name")
+        or f"{classification.get('color','')} {classification.get('subcategory','Item')}".strip(),
         confidence=classification.get("confidence", "medium"),
     )
 
+    return {
+        "item": item,
+        "cutout": normalized,
+        "hash": imagehash.phash(normalized.convert("RGB")),
+        "quality": _cutout_quality_score(normalized),
+    }
 
-async def _process_frames_concurrently(frames: List["Image.Image"]) -> List[DetectedItem]:
+
+async def _process_frames_concurrently(frames: List["Image.Image"]) -> List[dict]:
     """
-    Processes all deduped frames in parallel, capped at
-    MAX_CONCURRENT_ITEM_PROCESSING at a time via a semaphore — so a
-    20-item scan doesn't fire 20 simultaneous Claude requests at once
-    and trip rate limits, but also doesn't process them one by one.
+    Process candidate frames concurrently while retaining garment cutouts
+    for the second dedupe pass.
     """
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_ITEM_PROCESSING)
 
@@ -371,7 +485,52 @@ async def _process_frames_concurrently(frames: List["Image.Image"]) -> List[Dete
 
     tasks = [_bounded(frame, f"scan_{i}") for i, frame in enumerate(frames)]
     results = await asyncio.gather(*tasks)
-    return [item for item in results if item is not None]  # drop frames that weren't actually garments
+
+    return [result for result in results if result is not None]
+
+
+def _dedupe_processed_garments(processed: List[dict]) -> tuple[List[DetectedItem], int]:
+    """
+    Second-pass duplicate removal on the ACTUAL normalized garment.
+
+    Whole-frame dedupe alone is not enough because a slight camera move
+    changes the wardrobe background. Here we compare garment cutouts.
+
+    When two candidates are duplicates, keep the sharper/better candidate.
+    """
+    kept: List[dict] = []
+    removed = 0
+
+    for candidate in processed:
+        duplicate_index = None
+
+        for idx, existing in enumerate(kept):
+            if not _same_garment_metadata(candidate["item"], existing["item"]):
+                continue
+
+            threshold = _garment_hash_threshold(candidate["item"], existing["item"])
+            distance = candidate["hash"] - existing["hash"]
+
+            if distance <= threshold:
+                duplicate_index = idx
+                break
+
+        if duplicate_index is None:
+            kept.append(candidate)
+            continue
+
+        removed += 1
+
+        if candidate["quality"] > kept[duplicate_index]["quality"]:
+            kept[duplicate_index] = candidate
+
+    items: List[DetectedItem] = []
+
+    for i, candidate in enumerate(kept[:MAX_ITEMS_RETURNED]):
+        item = candidate["item"].model_copy(update={"temp_id": f"scan_{i}"})
+        items.append(item)
+
+    return items, removed
 
 
 async def _run_video_scan_job(job_id: str, tmp_path: str, push_token: Optional[str]):
@@ -387,9 +546,13 @@ async def _run_video_scan_job(job_id: str, tmp_path: str, push_token: Optional[s
             _jobs[job_id]["error"] = "No usable frames found — video may be too dark, too blurry, or too short."
             return
 
-        deduped = _dedupe_frames(raw_frames)
-        duplicates_removed = len(raw_frames) - len(deduped)
-        items = await _process_frames_concurrently(deduped)
+        deduped_frames = _dedupe_frames(raw_frames)
+        frame_duplicates_removed = len(raw_frames) - len(deduped_frames)
+
+        processed = await _process_frames_concurrently(deduped_frames)
+        items, garment_duplicates_removed = _dedupe_processed_garments(processed)
+
+        duplicates_removed = frame_duplicates_removed + garment_duplicates_removed
 
         _jobs[job_id].update({
             "status": "done",
