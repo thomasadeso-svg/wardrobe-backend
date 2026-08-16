@@ -66,9 +66,10 @@ router = APIRouter()
 # ── Guardrails ──────────────────────────────────────────────────────────
 MAX_VIDEO_SECONDS = 20
 FRAME_SAMPLE_INTERVAL_SEC = 0.5   # back to 2/sec — denser sampling is FINE now that temporal run-grouping collapses consecutive frames, and it makes run boundaries easier to detect
-RUN_BOUNDARY_THRESHOLD = 9        # STAGE 1 (temporal): combined shape+color signature distance between CONSECUTIVE frames above which we call it a new garment. Tuned against measured values: same garment mid-pan ~2-4, different garment ~13+. Higher = more merging; lower = more splits.
+RUN_BOUNDARY_THRESHOLD = 13       # STAGE 1 (temporal): combined shape+color signature distance between CONSECUTIVE frames above which we call it a new garment. Raised 9 -> 13: at 9, one poncho was split across multiple runs and Claude then labelled the pieces inconsistently ("poncho/cape sweater" vs "cape or poncho" vs "top"), which defeated the category-based stage-2 merge. Merging harder HERE means one garment gets one label, so contradictions can't arise — and it's cheaper (fewer Claude calls). If genuinely different garments start merging, come back down toward 11.
 COLOR_HASH_WEIGHT = 1.5           # colorhash counts a bit more than phash in the signature distance, since garments often differ mainly by color while keeping a similar silhouette on a rail.
 GARMENT_DEDUP_HASH_THRESHOLD = 16 # STAGE 2 (post-classification safety net): merge same-category items whose frames are visually close. Raised, and now category-only (color strings like "beige" vs "cream" were too brittle to match on).
+VISUAL_ONLY_MERGE_THRESHOLD = 6   # STAGE 2 fallback: merge even across DIFFERENT categories when frames are near-identical — covers Claude labelling one garment inconsistently ("outerwear" one frame, "top" the next). Deliberately strict so distinct items hanging side by side don't collapse into one.
 MAX_ITEMS_RETURNED = 20
 MIN_FRAME_SHARPNESS = 22.0        # relaxed from 40 — was rejecting clearly-identifiable garments for mild motion blur. Lower = more forgiving.
 MAX_CONCURRENT_ITEM_PROCESSING = 5  # cap parallel rembg+Claude calls — protects Claude rate limits and Railway CPU
@@ -359,7 +360,9 @@ def _classify_with_claude(img: "Image.Image") -> dict:
         "classify it. Respond with ONLY valid JSON, no markdown, no preamble:\n"
         "{\n"
         '  "category": "top|bottom|dress|shoes|outerwear|accessory",\n'
-        '  "subcategory": "short specific type, e.g. blazer, jeans, sneakers",\n'
+        '  "subcategory": "ONE specific type, e.g. blazer, jeans, sneakers. Commit to a single '
+        'answer — do NOT hedge with slashes or \'or\' (never \'poncho/cape\' or \'skirt or trousers\'). '
+        'Pick the single most likely one.",\n'
         '  "color": "primary color name",\n'
         '  "colors": ["array", "of", "all", "visible", "colors"],\n'
         '  "style": "casual|formal|sporty|elegant|streetwear",\n'
@@ -491,13 +494,27 @@ def _garment_level_dedupe(raw_results: List[dict]) -> List[dict]:
     for r in raw_results:
         merged = False
         for i, k in enumerate(kept):
-            same_type = r.get("category") == k.get("category")
-            if same_type and r["_frame_hash"] is not None and k["_frame_hash"] is not None:
-                if (r["_frame_hash"] - k["_frame_hash"]) <= GARMENT_DEDUP_HASH_THRESHOLD:
-                    if r["_sharpness"] > k["_sharpness"]:
-                        kept[i] = r  # keep the sharper of the two
-                    merged = True
-                    break
+            if r["_frame_hash"] is None or k["_frame_hash"] is None:
+                continue
+            dist = r["_frame_hash"] - k["_frame_hash"]
+
+            same_category_close = (r.get("category") == k.get("category")
+                                   and dist <= GARMENT_DEDUP_HASH_THRESHOLD)
+
+            # Fallback for Claude's uncertainty: if two frames are VERY
+            # visually close but got different categories, that's almost
+            # always one garment Claude labelled inconsistently (e.g. the
+            # same poncho as "outerwear" once and "top" the next frame),
+            # not two real items. Threshold is deliberately much stricter
+            # than the same-category one so we don't merge a black blazer
+            # with black trousers hanging beside it.
+            near_identical_diff_category = dist <= VISUAL_ONLY_MERGE_THRESHOLD
+
+            if same_category_close or near_identical_diff_category:
+                if r["_sharpness"] > k["_sharpness"]:
+                    kept[i] = r  # keep the sharper of the two
+                merged = True
+                break
         if not merged:
             kept.append(r)
     return kept
