@@ -66,10 +66,9 @@ router = APIRouter()
 # ── Guardrails ──────────────────────────────────────────────────────────
 MAX_VIDEO_SECONDS = 20
 FRAME_SAMPLE_INTERVAL_SEC = 0.5   # back to 2/sec — denser sampling is FINE now that temporal run-grouping collapses consecutive frames, and it makes run boundaries easier to detect
-RUN_BOUNDARY_THRESHOLD = 13       # STAGE 1 (temporal): combined shape+color signature distance between CONSECUTIVE frames above which we call it a new garment. Raised 9 -> 13: at 9, one poncho was split across multiple runs and Claude then labelled the pieces inconsistently ("poncho/cape sweater" vs "cape or poncho" vs "top"), which defeated the category-based stage-2 merge. Merging harder HERE means one garment gets one label, so contradictions can't arise — and it's cheaper (fewer Claude calls). If genuinely different garments start merging, come back down toward 11.
-COLOR_HASH_WEIGHT = 1.5           # colorhash counts a bit more than phash in the signature distance, since garments often differ mainly by color while keeping a similar silhouette on a rail.
-GARMENT_DEDUP_HASH_THRESHOLD = 16 # STAGE 2 (post-classification safety net): merge same-category items whose frames are visually close. Raised, and now category-only (color strings like "beige" vs "cream" were too brittle to match on).
-VISUAL_ONLY_MERGE_THRESHOLD = 6   # STAGE 2 fallback: merge even across DIFFERENT categories when frames are near-identical — covers Claude labelling one garment inconsistently ("outerwear" one frame, "top" the next). Deliberately strict so distinct items hanging side by side don't collapse into one.
+TRACK_MAX_FRAME_GAP = 3           # TRACKING: a candidate can join a track only if it's within this many sampled frames of that track's last appearance. This is the "temporal continuity" guard (spec #6) — it stops a genuinely different but similar-looking garment later in the video from merging into an earlier one.
+TRACK_SIMILARITY_THRESHOLD = 14   # TRACKING: max shape+color distance between GARMENT CROPS (not raw frames) for them to count as the same physical item. Crops of one item are far more consistent than raw frames, so this can be generous without over-merging.
+COLOR_HASH_WEIGHT = 1.5           # colorhash counts a bit more than phash in signature distance, since garments often differ mainly by color while keeping a similar silhouette on a rail.
 MAX_ITEMS_RETURNED = 20
 MIN_FRAME_SHARPNESS = 22.0        # relaxed from 40 — was rejecting clearly-identifiable garments for mild motion blur. Lower = more forgiving.
 MAX_CONCURRENT_ITEM_PROCESSING = 5  # cap parallel rembg+Claude calls — protects Claude rate limits and Railway CPU
@@ -211,83 +210,118 @@ def _extract_candidate_frames(video_path: str) -> List["Image.Image"]:
     return frames
 
 
-def _frame_signature(img: "Image.Image"):
+def _crop_signature(crop: "Image.Image"):
     """
-    Combined signature for run-boundary detection.
+    Visual fingerprint of a CLEANED GARMENT CROP (post-rembg, post-framing)
+    — NOT the raw video frame.
 
-    Why two hashes: phash captures shape/structure but is nearly
-    color-blind — measured on test frames, two garments of completely
-    different colors but similar silhouette differ by only ~8, while the
-    SAME garment mid-pan differs by ~2. That gap is too narrow to
-    threshold reliably. colorhash covers the missing dimension, so a
-    beige blazer and a black blazer separate cleanly.
+    This is the central fix for the "same sandals appear 3x" bug. Raw
+    video frames of one garment differ by background, rail, wall, and the
+    user's hand, so their hashes diverge and temporal runs got cut
+    mid-garment. Once the background is stripped and the garment is
+    normalized to a centered square, adjacent captures of the SAME item
+    become near-identical, which is what dedup actually needs.
+
+    Composited onto white first: phash/colorhash ignore alpha, so
+    transparent regions would otherwise read as black and swamp the
+    signal.
     """
-    return imagehash.phash(img), imagehash.colorhash(img)
+    if crop.mode != "RGBA":
+        crop = crop.convert("RGBA")
+    white = Image.new("RGB", crop.size, (255, 255, 255))
+    white.paste(crop, mask=crop.getchannel("A"))
+    return imagehash.phash(white), imagehash.colorhash(white)
 
 
-def _signature_distance(sig_a, sig_b) -> float:
-    """Weighted distance between two frame signatures (shape + color)."""
-    p_dist = sig_a[0] - sig_b[0]
-    c_dist = sig_a[1] - sig_b[1]
-    return p_dist + (c_dist * COLOR_HASH_WEIGHT)
+def _crop_distance(sig_a, sig_b) -> float:
+    """Weighted shape+color distance between two garment-crop signatures."""
+    return (sig_a[0] - sig_b[0]) + ((sig_a[1] - sig_b[1]) * COLOR_HASH_WEIGHT)
 
 
-def _group_frames_into_runs(frames: List["Image.Image"]) -> List[tuple]:
+def _colors_compatible(a: Optional[str], b: Optional[str]) -> bool:
     """
-    STAGE 1 — TEMPORAL RUN GROUPING (replaces the old unordered dedup).
-
-    Key insight: a closet pan is a TIME SEQUENCE. Frames adjacent in time
-    are almost certainly the same garment; a sharp visual change means you
-    panned onto the next item. The old approach compared every frame to
-    every kept frame as an unordered pile, which threw that structure away
-    — that's why the same coat at two angles (or with a hand in frame)
-    slipped through as two items.
-
-    Here we walk frames IN ORDER and cut a new "run" only when a frame
-    diverges sharply from the previous one (by combined shape+color
-    signature). Each run = one garment; we keep the SHARPEST frame from
-    that run as its representative.
-
-    Returns [(representative_image, phash), ...] — the phash is passed on
-    for stage 2's safety-net comparison.
-
-    Limitation (known, accepted): if the user pans past a coat, moves on,
-    then swings BACK to it, that's two separate runs and will produce two
-    entries. Stage 2 garment dedup is the safety net for that case.
+    Loose color compatibility. Claude's color wording drifts across frames
+    of one garment ("beige"/"cream"/"tan"), so exact equality is too
+    strict — but we still want black vs pink to block a merge. Treats
+    colors as compatible if either is missing, they share a word, or both
+    fall in the same coarse family.
     """
-    if not frames:
-        return []
+    if not a or not b:
+        return True
+    a, b = a.lower().strip(), b.lower().strip()
+    if a == b or a in b or b in a:
+        return True
+    families = [
+        {"black", "charcoal", "onyx", "jet"},
+        {"white", "cream", "ivory", "off-white", "eggshell"},
+        {"beige", "tan", "camel", "khaki", "sand", "nude", "taupe", "brown", "chocolate"},
+        {"grey", "gray", "silver", "slate"},
+        {"navy", "blue", "denim", "indigo", "cobalt"},
+        {"pink", "rose", "blush", "salmon"},
+        {"red", "burgundy", "maroon", "wine"},
+        {"green", "olive", "khaki", "sage", "emerald"},
+    ]
+    for fam in families:
+        if any(w in a for w in fam) and any(w in b for w in fam):
+            return True
+    return False
 
-    runs: List[List[tuple]] = []          # each run: [(img, signature, sharpness), ...]
-    current: List[tuple] = []
-    prev_sig = None
 
-    for img in frames:
-        sig = _frame_signature(img)
-        sharp = _sharpness_pil(img)
+def _build_garment_tracks(candidates: List[dict]) -> List[dict]:
+    """
+    TEMPORAL GARMENT TRACKING (replaces the old frame-run grouping).
 
-        if prev_sig is None:
-            current = [(img, sig, sharp)]
-        elif _signature_distance(sig, prev_sig) <= RUN_BOUNDARY_THRESHOLD:
-            # visually continuous with the previous frame -> same garment
-            current.append((img, sig, sharp))
-        else:
-            # sharp change -> panned onto a new garment
-            runs.append(current)
-            current = [(img, sig, sharp)]
+    Each candidate carries its frame_index, cleaned garment crop
+    signature, classification, sharpness and confidence. We walk them in
+    CAPTURE ORDER and attach each to an existing track when it is:
+      - temporally NEARBY (within TRACK_MAX_FRAME_GAP of that track's last
+        frame) — this is what stops a genuinely different but similar
+        garment later in the video from being merged into an earlier one,
+      - category-compatible,
+      - color-compatible (loose matching, see _colors_compatible),
+      - visually similar on the CROP signature.
 
-        prev_sig = sig
+    One track = one physical garment. We then keep the single BEST
+    candidate per track (sharpest, preferring higher confidence).
+    """
+    tracks: List[dict] = []  # each: {last_frame, sig, category, color, best}
 
-    if current:
-        runs.append(current)
+    def better(a: dict, b: dict) -> dict:
+        """Pick the nicer candidate: confidence first, then sharpness."""
+        rank = {"high": 2, "medium": 1, "low": 0}
+        ra, rb = rank.get(a.get("confidence", "medium"), 1), rank.get(b.get("confidence", "medium"), 1)
+        if ra != rb:
+            return a if ra > rb else b
+        return a if a["_sharpness"] >= b["_sharpness"] else b
 
-    # One representative per run: the sharpest frame in it.
-    representatives = []
-    for run in runs[:MAX_ITEMS_RETURNED]:
-        best = max(run, key=lambda t: t[2])   # t = (img, signature, sharpness)
-        representatives.append((best[0], best[1][0]))  # pass phash onward for stage 2
+    for cand in sorted(candidates, key=lambda c: c["_frame_index"]):
+        attached = False
+        for tr in tracks:
+            if cand["_frame_index"] - tr["last_frame"] > TRACK_MAX_FRAME_GAP:
+                continue  # too far apart in time -> treat as a different garment
+            if cand.get("category") != tr["category"]:
+                continue
+            if not _colors_compatible(cand.get("color"), tr["color"]):
+                continue
+            if _crop_distance(cand["_crop_sig"], tr["sig"]) > TRACK_SIMILARITY_THRESHOLD:
+                continue
+            # same garment, continuing
+            tr["best"] = better(tr["best"], cand)
+            tr["last_frame"] = cand["_frame_index"]
+            tr["sig"] = cand["_crop_sig"]  # track the most recent appearance
+            attached = True
+            break
 
-    return representatives
+        if not attached:
+            tracks.append({
+                "last_frame": cand["_frame_index"],
+                "sig": cand["_crop_sig"],
+                "category": cand.get("category"),
+                "color": cand.get("color"),
+                "best": cand,
+            })
+
+    return [tr["best"] for tr in tracks]
 
 
 def _sharpness_pil(img: "Image.Image") -> float:
@@ -441,23 +475,26 @@ async def scan_photo(request: Request, file: UploadFile = File(...)):
     )
 
 
-def _process_single_frame_sync(frame: "Image.Image", frame_hash, temp_id: str):
+def _process_single_frame_sync(frame: "Image.Image", frame_index: int, temp_id: str):
     """
-    Blocking work for ONE detected item: background removal + Claude
-    classification. Runs inside a thread (via asyncio.to_thread) so
-    multiple items can be processed concurrently.
+    Per-frame work: background removal -> normalized crop -> classification.
 
-    Returns a dict (not yet a DetectedItem) carrying the frame_hash and a
-    sharpness score, so the stage-2 garment dedup can merge same-garment
-    results and keep the cleanest one before we build final DetectedItems.
+    Note the ORDER change: rembg + framing now run BEFORE dedup, because
+    dedup fingerprints the cleaned garment crop (that's the whole fix).
+    This costs more CPU per frame, but Claude — the expensive part — still
+    only sees the deduped survivors, so API spend stays controlled.
+
+    Returns a candidate dict carrying _frame_index, _crop_sig, _sharpness
+    for the tracker; those internal fields are stripped before returning
+    to the client.
     """
     cutout = _remove_background(frame)
-    classification = _classify_with_claude(cutout)
+    cutout = _frame_cutout(cutout)  # normalize: crop tight, center, pad into uniform square
 
+    classification = _classify_with_claude(cutout)
     if not classification.get("category"):
         return None
 
-    cutout = _frame_cutout(cutout)  # normalize: crop tight, center, pad into uniform square
     buf = io.BytesIO()
     cutout.save(buf, format="PNG")
     return {
@@ -472,76 +509,37 @@ def _process_single_frame_sync(frame: "Image.Image", frame_hash, temp_id: str):
         "fabric_guess": classification.get("fabric_guess"),
         "name": classification.get("name") or f"{classification.get('color','')} {classification.get('subcategory','Item')}".strip(),
         "confidence": classification.get("confidence", "medium"),
-        "_frame_hash": frame_hash,          # internal, stripped before returning to client
-        "_sharpness": _sharpness_pil(cutout),  # internal, for keeping cleanest of a merge group
+        "_frame_index": frame_index,             # internal: preserves capture order
+        "_crop_sig": _crop_signature(cutout),    # internal: fingerprint of the CLEAN crop
+        "_sharpness": _sharpness_pil(cutout),    # internal: for picking the best in a track
     }
 
 
-def _garment_level_dedupe(raw_results: List[dict]) -> List[dict]:
+async def _process_frames_concurrently(frames: List["Image.Image"]) -> List[DetectedItem]:
     """
-    STAGE 2 dedup (post-classification safety net): catches same-garment
-    duplicates that temporal grouping missed — mainly the "panned back to
-    it later" case, where the same coat appears in two non-adjacent runs.
+    Runs every sampled frame through rembg + framing + classification in
+    parallel (semaphore-capped), then collapses the resulting candidates
+    into garment TRACKS — one track per physical item — and returns the
+    best candidate from each.
 
-    Matches on CATEGORY + visual similarity. Deliberately NOT on color:
-    Claude returns "beige" for one frame and "cream"/"tan" for the next of
-    the SAME blazer, so requiring color equality meant near-identical
-    items never merged. Category + a visual-hash check is the better
-    trade — still guards against merging a blazer with a shirt, while
-    tolerating the color-wording noise.
-    """
-    kept: List[dict] = []
-    for r in raw_results:
-        merged = False
-        for i, k in enumerate(kept):
-            if r["_frame_hash"] is None or k["_frame_hash"] is None:
-                continue
-            dist = r["_frame_hash"] - k["_frame_hash"]
-
-            same_category_close = (r.get("category") == k.get("category")
-                                   and dist <= GARMENT_DEDUP_HASH_THRESHOLD)
-
-            # Fallback for Claude's uncertainty: if two frames are VERY
-            # visually close but got different categories, that's almost
-            # always one garment Claude labelled inconsistently (e.g. the
-            # same poncho as "outerwear" once and "top" the next frame),
-            # not two real items. Threshold is deliberately much stricter
-            # than the same-category one so we don't merge a black blazer
-            # with black trousers hanging beside it.
-            near_identical_diff_category = dist <= VISUAL_ONLY_MERGE_THRESHOLD
-
-            if same_category_close or near_identical_diff_category:
-                if r["_sharpness"] > k["_sharpness"]:
-                    kept[i] = r  # keep the sharper of the two
-                merged = True
-                break
-        if not merged:
-            kept.append(r)
-    return kept
-
-
-async def _process_frames_concurrently(frame_pairs: List[tuple]) -> List[DetectedItem]:
-    """
-    Processes deduped (image, hash) pairs in parallel (capped by a
-    semaphore), then runs stage-2 garment dedup on the results, then
-    builds the final DetectedItem list (stripping internal fields).
+    Async API contract is unchanged: still returns List[DetectedItem].
     """
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_ITEM_PROCESSING)
 
-    async def _bounded(frame, frame_hash, temp_id):
+    async def _bounded(frame, idx):
         async with semaphore:
-            return await asyncio.to_thread(_process_single_frame_sync, frame, frame_hash, temp_id)
+            return await asyncio.to_thread(_process_single_frame_sync, frame, idx, f"scan_{idx}")
 
-    tasks = [_bounded(frame, fhash, f"scan_{i}") for i, (frame, fhash) in enumerate(frame_pairs)]
+    tasks = [_bounded(frame, i) for i, frame in enumerate(frames)]
     results = await asyncio.gather(*tasks)
-    raw = [r for r in results if r is not None]  # drop frames that weren't garments
+    candidates = [r for r in results if r is not None]
 
-    deduped = _garment_level_dedupe(raw)
+    tracked = _build_garment_tracks(candidates)[:MAX_ITEMS_RETURNED]
 
     final: List[DetectedItem] = []
-    for r in deduped:
-        r.pop("_frame_hash", None)
-        r.pop("_sharpness", None)
+    for r in tracked:
+        for internal in ("_frame_index", "_crop_sig", "_sharpness"):
+            r.pop(internal, None)
         final.append(DetectedItem(**r))
     return final
 
@@ -559,14 +557,11 @@ async def _run_video_scan_job(job_id: str, tmp_path: str, push_token: Optional[s
             _jobs[job_id]["error"] = "No usable frames found — video may be too dark, too blurry, or too short."
             return
 
-        deduped = _group_frames_into_runs(raw_frames)
-        stage1_removed = len(raw_frames) - len(deduped)
-        items = await _process_frames_concurrently(deduped)
-        # total dupes = frames dropped in stage 1 + same-garment merges in stage 2
-        # (raw_frames -> deduped is stage 1; deduped -> items is stage 2, minus any
-        #  frames that classified as "no garment", but that's close enough for a user-facing count)
-        stage2_removed = max(0, len(deduped) - len(items))
-        duplicates_removed = stage1_removed + stage2_removed
+        # All sampled frames go through processing now — garment TRACKING
+        # (post-rembg, on the clean crop) does the deduplication, rather
+        # than pre-filtering frames on raw-frame similarity.
+        items = await _process_frames_concurrently(raw_frames)
+        duplicates_removed = max(0, len(raw_frames) - len(items))
 
         _jobs[job_id].update({
             "status": "done",
