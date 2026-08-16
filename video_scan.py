@@ -65,9 +65,10 @@ router = APIRouter()
 
 # ── Guardrails ──────────────────────────────────────────────────────────
 MAX_VIDEO_SECONDS = 20
-FRAME_SAMPLE_INTERVAL_SEC = 1.0   # sample ~once/sec — a slow pan doesn't need 2/sec, and fewer frames = fewer dupes + lower cost
-DEDUP_HASH_THRESHOLD = 6          # STAGE 1 (pre-Claude, conservative): only drop near-identical adjacent frames. Kept low so we don't over-merge distinct garments here; the stronger merge happens post-classification.
-GARMENT_DEDUP_HASH_THRESHOLD = 12 # STAGE 2 (post-classification, aggressive): merge items that came back as the SAME garment (same category+color, visually close). This is what kills the "7 button-down shirts" problem.
+FRAME_SAMPLE_INTERVAL_SEC = 0.5   # back to 2/sec — denser sampling is FINE now that temporal run-grouping collapses consecutive frames, and it makes run boundaries easier to detect
+RUN_BOUNDARY_THRESHOLD = 9        # STAGE 1 (temporal): combined shape+color signature distance between CONSECUTIVE frames above which we call it a new garment. Tuned against measured values: same garment mid-pan ~2-4, different garment ~13+. Higher = more merging; lower = more splits.
+COLOR_HASH_WEIGHT = 1.5           # colorhash counts a bit more than phash in the signature distance, since garments often differ mainly by color while keeping a similar silhouette on a rail.
+GARMENT_DEDUP_HASH_THRESHOLD = 16 # STAGE 2 (post-classification safety net): merge same-category items whose frames are visually close. Raised, and now category-only (color strings like "beige" vs "cream" were too brittle to match on).
 MAX_ITEMS_RETURNED = 20
 MIN_FRAME_SHARPNESS = 22.0        # relaxed from 40 — was rejecting clearly-identifiable garments for mild motion blur. Lower = more forgiving.
 MAX_CONCURRENT_ITEM_PROCESSING = 5  # cap parallel rembg+Claude calls — protects Claude rate limits and Railway CPU
@@ -209,34 +210,83 @@ def _extract_candidate_frames(video_path: str) -> List["Image.Image"]:
     return frames
 
 
-def _dedupe_frames(frames: List["Image.Image"]) -> List[tuple]:
+def _frame_signature(img: "Image.Image"):
     """
-    STAGE 1 dedup (conservative, pre-Claude): a slow pan produces many
-    near-identical frames of the SAME garment. We collapse only the
-    obviously-adjacent-identical ones here, and — unlike before — when
-    several frames are near-duplicates we KEEP THE SHARPEST one rather
-    than the first, so the cleanest capture of each garment survives.
+    Combined signature for run-boundary detection.
 
-    Returns list of (image, phash) tuples so stage 2 can reuse the hash
-    without recomputing.
+    Why two hashes: phash captures shape/structure but is nearly
+    color-blind — measured on test frames, two garments of completely
+    different colors but similar silhouette differ by only ~8, while the
+    SAME garment mid-pan differs by ~2. That gap is too narrow to
+    threshold reliably. colorhash covers the missing dimension, so a
+    beige blazer and a black blazer separate cleanly.
     """
-    kept: List[tuple] = []  # (image, hash, sharpness)
+    return imagehash.phash(img), imagehash.colorhash(img)
+
+
+def _signature_distance(sig_a, sig_b) -> float:
+    """Weighted distance between two frame signatures (shape + color)."""
+    p_dist = sig_a[0] - sig_b[0]
+    c_dist = sig_a[1] - sig_b[1]
+    return p_dist + (c_dist * COLOR_HASH_WEIGHT)
+
+
+def _group_frames_into_runs(frames: List["Image.Image"]) -> List[tuple]:
+    """
+    STAGE 1 — TEMPORAL RUN GROUPING (replaces the old unordered dedup).
+
+    Key insight: a closet pan is a TIME SEQUENCE. Frames adjacent in time
+    are almost certainly the same garment; a sharp visual change means you
+    panned onto the next item. The old approach compared every frame to
+    every kept frame as an unordered pile, which threw that structure away
+    — that's why the same coat at two angles (or with a hand in frame)
+    slipped through as two items.
+
+    Here we walk frames IN ORDER and cut a new "run" only when a frame
+    diverges sharply from the previous one (by combined shape+color
+    signature). Each run = one garment; we keep the SHARPEST frame from
+    that run as its representative.
+
+    Returns [(representative_image, phash), ...] — the phash is passed on
+    for stage 2's safety-net comparison.
+
+    Limitation (known, accepted): if the user pans past a coat, moves on,
+    then swings BACK to it, that's two separate runs and will produce two
+    entries. Stage 2 garment dedup is the safety net for that case.
+    """
+    if not frames:
+        return []
+
+    runs: List[List[tuple]] = []          # each run: [(img, signature, sharpness), ...]
+    current: List[tuple] = []
+    prev_sig = None
+
     for img in frames:
-        h = imagehash.phash(img)
+        sig = _frame_signature(img)
         sharp = _sharpness_pil(img)
-        merged = False
-        for i, (kimg, kh, ksharp) in enumerate(kept):
-            if h - kh <= DEDUP_HASH_THRESHOLD:
-                # same garment as an already-kept frame — keep whichever is sharper
-                if sharp > ksharp:
-                    kept[i] = (img, h, sharp)
-                merged = True
-                break
-        if not merged:
-            kept.append((img, h, sharp))
-        if len(kept) >= MAX_ITEMS_RETURNED:
-            break
-    return [(img, h) for (img, h, _s) in kept]
+
+        if prev_sig is None:
+            current = [(img, sig, sharp)]
+        elif _signature_distance(sig, prev_sig) <= RUN_BOUNDARY_THRESHOLD:
+            # visually continuous with the previous frame -> same garment
+            current.append((img, sig, sharp))
+        else:
+            # sharp change -> panned onto a new garment
+            runs.append(current)
+            current = [(img, sig, sharp)]
+
+        prev_sig = sig
+
+    if current:
+        runs.append(current)
+
+    # One representative per run: the sharpest frame in it.
+    representatives = []
+    for run in runs[:MAX_ITEMS_RETURNED]:
+        best = max(run, key=lambda t: t[2])   # t = (img, signature, sharpness)
+        representatives.append((best[0], best[1][0]))  # pass phash onward for stage 2
+
+    return representatives
 
 
 def _sharpness_pil(img: "Image.Image") -> float:
@@ -426,20 +476,22 @@ def _process_single_frame_sync(frame: "Image.Image", frame_hash, temp_id: str):
 
 def _garment_level_dedupe(raw_results: List[dict]) -> List[dict]:
     """
-    STAGE 2 dedup (aggressive, post-classification): this is the fix for
-    "same shirt appears 6 times". Two results are treated as the SAME
-    garment when they share category + primary color AND their frames are
-    visually close (phash within GARMENT_DEDUP_HASH_THRESHOLD). Among a
-    merge group we keep the SHARPEST cutout. Requiring category+color to
-    match (not just visual similarity) is the guard against wrongly
-    merging two genuinely-different-but-similar items.
+    STAGE 2 dedup (post-classification safety net): catches same-garment
+    duplicates that temporal grouping missed — mainly the "panned back to
+    it later" case, where the same coat appears in two non-adjacent runs.
+
+    Matches on CATEGORY + visual similarity. Deliberately NOT on color:
+    Claude returns "beige" for one frame and "cream"/"tan" for the next of
+    the SAME blazer, so requiring color equality meant near-identical
+    items never merged. Category + a visual-hash check is the better
+    trade — still guards against merging a blazer with a shirt, while
+    tolerating the color-wording noise.
     """
     kept: List[dict] = []
     for r in raw_results:
         merged = False
         for i, k in enumerate(kept):
-            same_type = (r.get("category") == k.get("category")
-                         and (r.get("color") or "").lower() == (k.get("color") or "").lower())
+            same_type = r.get("category") == k.get("category")
             if same_type and r["_frame_hash"] is not None and k["_frame_hash"] is not None:
                 if (r["_frame_hash"] - k["_frame_hash"]) <= GARMENT_DEDUP_HASH_THRESHOLD:
                     if r["_sharpness"] > k["_sharpness"]:
@@ -490,7 +542,7 @@ async def _run_video_scan_job(job_id: str, tmp_path: str, push_token: Optional[s
             _jobs[job_id]["error"] = "No usable frames found — video may be too dark, too blurry, or too short."
             return
 
-        deduped = _dedupe_frames(raw_frames)
+        deduped = _group_frames_into_runs(raw_frames)
         stage1_removed = len(raw_frames) - len(deduped)
         items = await _process_frames_concurrently(deduped)
         # total dupes = frames dropped in stage 1 + same-garment merges in stage 2
