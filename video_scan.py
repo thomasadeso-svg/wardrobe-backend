@@ -66,9 +66,10 @@ router = APIRouter()
 # ── Guardrails ──────────────────────────────────────────────────────────
 MAX_VIDEO_SECONDS = 20
 FRAME_SAMPLE_INTERVAL_SEC = 0.5   # back to 2/sec — denser sampling is FINE now that temporal run-grouping collapses consecutive frames, and it makes run boundaries easier to detect
-TRACK_MAX_FRAME_GAP = 3           # TRACKING: a candidate can join a track only if it's within this many sampled frames of that track's last appearance. This is the "temporal continuity" guard (spec #6) — it stops a genuinely different but similar-looking garment later in the video from merging into an earlier one.
-TRACK_SIMILARITY_THRESHOLD = 14   # TRACKING: max shape+color distance between GARMENT CROPS (not raw frames) for them to count as the same physical item. Crops of one item are far more consistent than raw frames, so this can be generous without over-merging.
+TRACK_MAX_FRAME_GAP = 6           # TRACKING: a candidate can join a track only if it's within this many sampled frames of that track's last appearance. Raised 3 -> 6: at 0.5s sampling a garment often stays in view several seconds, so 3 was cutting tracks mid-garment. Still bounded, so a similar item much later in the video stays separate (spec #6).
+TRACK_SIMILARITY_THRESHOLD = 20   # TRACKING: max shape+color distance between GARMENT CROPS (not raw frames) for them to count as the same physical item. Raised 14 -> 20: rembg smearing/artifacts and angle changes on the SAME garment shift the crop signature more than initially estimated. Watch the TRACK_DEBUG logs before moving this again.
 COLOR_HASH_WEIGHT = 1.5           # colorhash counts a bit more than phash in signature distance, since garments often differ mainly by color while keeping a similar silhouette on a rail.
+TRACK_DEBUG = True                # logs measured candidate-to-track distances so thresholds can be tuned from real numbers instead of guesswork. Safe to leave on (stdout only); set False to quieten Railway logs.
 MAX_ITEMS_RETURNED = 20
 MIN_FRAME_SHARPNESS = 22.0        # relaxed from 40 — was rejecting clearly-identifiable garments for mild motion blur. Lower = more forgiving.
 MAX_CONCURRENT_ITEM_PROCESSING = 5  # cap parallel rembg+Claude calls — protects Claude rate limits and Railway CPU
@@ -295,24 +296,53 @@ def _build_garment_tracks(candidates: List[dict]) -> List[dict]:
         return a if a["_sharpness"] >= b["_sharpness"] else b
 
     for cand in sorted(candidates, key=lambda c: c["_frame_index"]):
-        attached = False
+        best_match = None       # (distance, track) — the closest track this candidate legitimately belongs to
+        best_rejection = None   # for logging: closest track we did NOT attach to, and why
+
+        # IMPORTANT: evaluate EVERY track, don't stop at the first one that
+        # rejects. An earlier-created track (e.g. the black shirt) will
+        # reject a cream shirt on color — but the cream shirt's own track
+        # may be further down the list. Bailing out early meant candidates
+        # never reached their real match and spawned duplicate tracks.
         for tr in tracks:
-            if cand["_frame_index"] - tr["last_frame"] > TRACK_MAX_FRAME_GAP:
-                continue  # too far apart in time -> treat as a different garment
-            if cand.get("category") != tr["category"]:
+            gap = cand["_frame_index"] - tr["last_frame"]
+            dist = _crop_distance(cand["_crop_sig"], tr["sig"])
+            cat_ok = cand.get("category") == tr["category"]
+            col_ok = _colors_compatible(cand.get("color"), tr["color"])
+
+            if gap > TRACK_MAX_FRAME_GAP:
+                reason = f"gap={gap}>{TRACK_MAX_FRAME_GAP}"
+            elif not cat_ok:
+                reason = f"category '{cand.get('category')}'!='{tr['category']}'"
+            elif not col_ok:
+                reason = f"color '{cand.get('color')}' vs '{tr['color']}'"
+            elif dist > TRACK_SIMILARITY_THRESHOLD:
+                reason = f"dist={dist:.1f}>{TRACK_SIMILARITY_THRESHOLD}"
+            else:
+                # valid match — keep the CLOSEST one rather than the first
+                if best_match is None or dist < best_match[0]:
+                    best_match = (dist, tr, gap)
                 continue
-            if not _colors_compatible(cand.get("color"), tr["color"]):
-                continue
-            if _crop_distance(cand["_crop_sig"], tr["sig"]) > TRACK_SIMILARITY_THRESHOLD:
-                continue
-            # same garment, continuing
+
+            if best_rejection is None or dist < best_rejection[0]:
+                best_rejection = (dist, reason)
+
+        if best_match is not None:
+            dist, tr, gap = best_match
             tr["best"] = better(tr["best"], cand)
             tr["last_frame"] = cand["_frame_index"]
-            tr["sig"] = cand["_crop_sig"]  # track the most recent appearance
-            attached = True
-            break
-
-        if not attached:
+            # NOTE: tr["sig"] is deliberately NOT updated. The track's
+            # signature stays anchored to the frame that created it.
+            # Updating it per-frame let a single rembg-artifact frame poison
+            # the track — the next clean frame of the same garment then
+            # measured far from that corrupted signature and spawned a
+            # duplicate. (Sharpness can't be trusted to reject artifact
+            # frames either: smearing ADDS edges, so artifacts often score
+            # as "sharper" than the clean capture.)
+            if TRACK_DEBUG:
+                print(f"[TRACK] frame {cand['_frame_index']} ({cand.get('subcategory')}) "
+                      f"-> MERGED (gap={gap}, dist={dist:.1f})")
+        else:
             tracks.append({
                 "last_frame": cand["_frame_index"],
                 "sig": cand["_crop_sig"],
@@ -320,6 +350,17 @@ def _build_garment_tracks(candidates: List[dict]) -> List[dict]:
                 "color": cand.get("color"),
                 "best": cand,
             })
+            if TRACK_DEBUG:
+                if best_rejection:
+                    d, reason = best_rejection
+                    print(f"[TRACK] frame {cand['_frame_index']} ({cand.get('subcategory')}, "
+                          f"{cand.get('color')}) -> NEW track. Closest rejected: dist={d:.1f}, "
+                          f"blocked by: {reason}")
+                else:
+                    print(f"[TRACK] frame {cand['_frame_index']} ({cand.get('subcategory')}) -> first track")
+
+    if TRACK_DEBUG:
+        print(f"[TRACK] === {len(candidates)} candidates -> {len(tracks)} garment tracks ===")
 
     return [tr["best"] for tr in tracks]
 
@@ -644,3 +685,4 @@ async def scan_status(job_id: str):
         duplicates_removed=job.get("duplicates_removed"),
         error=job.get("error"),
     )
+   
