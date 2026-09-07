@@ -5,6 +5,7 @@ from pathlib import Path
 import anthropic
 import os
 import io
+import asyncio
 import base64
 import json
 import random
@@ -12,7 +13,7 @@ import re
 import hashlib
 import requests
 from PIL import Image, ImageEnhance
-from rembg import remove, new_session
+from background_removal import remove_background_bytes
 from video_scan import router as video_scan_router
 
 app = FastAPI()
@@ -30,7 +31,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 REMOVE_BG_API_KEY = os.getenv("REMOVE_BG_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-rembg_session = new_session("u2netp")
+ # Sessions load lazily on first use, through background_removal.py.
 
 vacation_cache = {}
 
@@ -71,7 +72,7 @@ async def remove_background(file: UploadFile = File(...)):
             img_input.save(buf_resized, format="JPEG", quality=90)
             input_data = buf_resized.getvalue()
 
-        output_data = remove(input_data, session=rembg_session)
+        output_data = await asyncio.to_thread(remove_background_bytes, input_data, "u2netp")
 
         img = Image.open(io.BytesIO(output_data)).convert("RGBA")
         r, g, b, a = img.split()
