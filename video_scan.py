@@ -1,50 +1,16 @@
-"""
-Video Wardrobe Scan — backend module for Styligma
-
-Feature: user films a pan across their closet; we extract frames, dedupe
-near-identical/repeated garments, remove backgrounds, classify each item
-with Claude vision, and return a review list for the app to confirm before
-anything is added to the wardrobe.
-
-ASYNC JOB MODEL: POST /scan-video returns a job_id immediately (202) and
-processes in the background — the app doesn't block waiting for results,
-and the user can record more scans while an earlier one is still running.
-Completion is signaled via an Expo push notification (if a push_token was
-supplied) with GET /scan-status/{job_id} as a polling fallback.
-
-MERGE INSTRUCTIONS:
-1. Add this router to backend-main.py:
-     from video_scan import router as video_scan_router
-     app.include_router(video_scan_router)
-2. Add new dependencies to requirements.txt:
-     opencv-python-headless
-     imagehash
-     httpx
-     Pillow  (already present via rembg dependency, but pin explicitly)
-3. Railway build: opencv-python-headless avoids needing system GUI libs
-   that opencv-python requires and that Railway's build image lacks.
-
-COST / SAFETY GUARDRAILS (do not remove without reconsidering):
-- MAX_VIDEO_SECONDS caps processing time and Claude API spend per scan.
-- MAX_ITEMS_RETURNED caps how many items get sent to the frontend, since
-  a long slow pan could otherwise generate 40+ near-duplicate candidates.
-- Frames are deduped BEFORE hitting Claude vision (not after), since the
-  Claude call is the expensive step — hashing is done locally and free.
-- Per-IP rate limit (5 scans / 24h) is a best-effort abuse deterrent —
-  the app has no accounts, so this is not a real security boundary, just
-  a cheap tripwire against scripted abuse. The actual free-tier cap
-  (1 free scan, then Pro) lives client-side in WardrobeStore.
-- Items are processed CONCURRENTLY (up to MAX_CONCURRENT_ITEM_PROCESSING
-  at once via asyncio + a semaphore), not one at a time. A 20-item scan
-  went from ~80s sequential to roughly however long the slowest single
-  item takes (~10-15s). Raise the concurrency cap cautiously — it's
-  bounded by Claude's rate limits and Railway's CPU, not just app logic.
+"""Video pan backend: streamed frames, serialized scans, explicit reusable model,
+exact consecutive-frame reuse before inference, and existing crop tracking.
+Near-duplicate frames still require classification before the crop tracker.
+Single process/replica only: job state remains in memory and is lost on restart.
 """
 
 import io
 import os
 import time
 import uuid
+import hashlib
+import logging
+from contextlib import suppress
 import asyncio
 import tempfile
 import base64
@@ -58,10 +24,37 @@ import httpx
 from PIL import Image
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
-from rembg import remove as rembg_remove
+from background_removal import remove_background_bytes
 import anthropic
 
 router = APIRouter()
+logger = logging.getLogger("uvicorn.error")
+_scan_lock = asyncio.Lock()
+_cleanup_task = None
+MAX_PENDING_SCANS = 4
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+# Explicit model avoids dependency upgrades silently changing the video model.
+VIDEO_REMBG_MODEL = os.getenv("VIDEO_REMBG_MODEL", "u2net")
+# 0 preserves input resolution; opt in to 1024 after comparing real scan quality.
+MAX_FRAME_EDGE = int(os.getenv("SCAN_MAX_FRAME_EDGE", "0"))
+
+@router.on_event("startup")
+async def start_scan_cleanup():
+    global _cleanup_task
+    _cleanup_task = asyncio.create_task(_cleanup_loop())
+
+@router.on_event("shutdown")
+async def stop_scan_cleanup():
+    if _cleanup_task is not None:
+        _cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _cleanup_task
+
+async def _cleanup_loop():
+    while True:
+        await asyncio.sleep(60)
+        _cleanup_old_jobs()
+
 
 # ── Guardrails ──────────────────────────────────────────────────────────
 MAX_VIDEO_SECONDS = 20
@@ -72,7 +65,7 @@ COLOR_HASH_WEIGHT = 1.5           # colorhash counts a bit more than phash in si
 TRACK_DEBUG = True                # logs measured candidate-to-track distances so thresholds can be tuned from real numbers instead of guesswork. Safe to leave on (stdout only); set False to quieten Railway logs.
 MAX_ITEMS_RETURNED = 20
 MIN_FRAME_SHARPNESS = 22.0        # relaxed from 40 — was rejecting clearly-identifiable garments for mild motion blur. Lower = more forgiving.
-MAX_CONCURRENT_ITEM_PROCESSING = 5  # cap parallel rembg+Claude calls — protects Claude rate limits and Railway CPU
+
 
 # ── Abuse guard ──────────────────────────────────────────────────────────
 # The app has no accounts (by design — see privacy policy), so we can't do
@@ -122,9 +115,18 @@ _jobs: Dict[str, dict] = {}
 
 def _cleanup_old_jobs():
     now = time.time()
-    expired = [jid for jid, job in _jobs.items() if now - job["created_at"] > JOB_RETENTION_SECONDS]
+    expired = [jid for jid, job in _jobs.items()
+               if job["status"] != "processing"
+               and now - job.get("finished_at", job["created_at"]) > JOB_RETENTION_SECONDS]
     for jid in expired:
         del _jobs[jid]
+    for ip, timestamps in list(_request_log.items()):
+        remaining = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW_SECONDS]
+        if remaining:
+            _request_log[ip] = remaining
+        else:
+            del _request_log[ip]
+
 
 
 async def _send_push_notification(push_token: str, title: str, body: str, data: dict):
@@ -180,35 +182,6 @@ def _sharpness(frame) -> float:
     """Laplacian variance — a simple, fast motion-blur detector. Low value = blurry frame, skip it."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
-
-
-def _extract_candidate_frames(video_path: str) -> List["Image.Image"]:
-    """Pull frames at a fixed interval, skip blurry ones. Returns PIL images."""
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_interval = max(1, int(fps * FRAME_SAMPLE_INTERVAL_SEC))
-
-    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps if fps else 0
-    if duration > MAX_VIDEO_SECONDS:
-        cap.release()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Video too long ({duration:.0f}s). Max {MAX_VIDEO_SECONDS}s — keep the pan short and steady.",
-        )
-
-    frames = []
-    idx = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if idx % frame_interval == 0:
-            if _sharpness(frame) >= MIN_FRAME_SHARPNESS:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(rgb))
-        idx += 1
-    cap.release()
-    return frames
 
 
 def _crop_signature(crop: "Image.Image"):
@@ -375,7 +348,7 @@ def _sharpness_pil(img: "Image.Image") -> float:
 def _remove_background(img: "Image.Image") -> "Image.Image":
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    result_bytes = rembg_remove(buf.getvalue())
+    result_bytes = remove_background_bytes(buf.getvalue(), VIDEO_REMBG_MODEL)
     return Image.open(io.BytesIO(result_bytes))
 
 
@@ -489,8 +462,8 @@ async def scan_photo(request: Request, file: UploadFile = File(...)):
     img_bytes = await file.read()
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-    cutout = _remove_background(img)
-    classification = _classify_with_claude(cutout)
+    cutout = await asyncio.to_thread(_remove_background, img)
+    classification = await asyncio.to_thread(_classify_with_claude, cutout)
 
     if not classification.get("category"):
         raise HTTPException(
@@ -522,8 +495,8 @@ def _process_single_frame_sync(frame: "Image.Image", frame_index: int, temp_id: 
 
     Note the ORDER change: rembg + framing now run BEFORE dedup, because
     dedup fingerprints the cleaned garment crop (that's the whole fix).
-    This costs more CPU per frame, but Claude — the expensive part — still
-    only sees the deduped survivors, so API spend stays controlled.
+    Exact repeated frames are reused by the caller; other frames still
+    require classification before the existing category-aware tracker.
 
     Returns a candidate dict carrying _frame_index, _crop_sig, _sharpness
     for the tracker; those internal fields are stripped before returning
@@ -556,33 +529,70 @@ def _process_single_frame_sync(frame: "Image.Image", frame_index: int, temp_id: 
     }
 
 
-async def _process_frames_concurrently(frames: List["Image.Image"]) -> List[DetectedItem]:
+def _process_video_sync(video_path):
+    """Stream sampled frames: only one raw frame is retained at a time.
+
+    Exact repeated samples reuse the previous result before rembg/Claude.
+    They still enter tracking at their original index, preserving track gaps.
+    Near-duplicate and angle matching remain the existing crop tracker.
     """
-    Runs every sampled frame through rembg + framing + classification in
-    parallel (semaphore-capped), then collapses the resulting candidates
-    into garment TRACKS — one track per physical item — and returns the
-    best candidate from each.
-
-    Async API contract is unchanged: still returns List[DetectedItem].
-    """
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_ITEM_PROCESSING)
-
-    async def _bounded(frame, idx):
-        async with semaphore:
-            return await asyncio.to_thread(_process_single_frame_sync, frame, idx, f"scan_{idx}")
-
-    tasks = [_bounded(frame, i) for i, frame in enumerate(frames)]
-    results = await asyncio.gather(*tasks)
-    candidates = [r for r in results if r is not None]
-
-    tracked = _build_garment_tracks(candidates)[:MAX_ITEMS_RETURNED]
-
-    final: List[DetectedItem] = []
-    for r in tracked:
-        for internal in ("_frame_index", "_crop_sig", "_sharpness"):
-            r.pop(internal, None)
-        final.append(DetectedItem(**r))
-    return final
+    cap = cv2.VideoCapture(video_path)
+    candidates = []
+    sampled = 0
+    processed = 0
+    repeated = 0
+    previous_digest = None
+    previous_result = None
+    started = time.monotonic()
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not cap.isOpened() or not (0 < fps <= 240):
+            raise ValueError("Could not read video frame rate.")
+        count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if count / fps > MAX_VIDEO_SECONDS:
+            raise ValueError(f"Video too long. Maximum {MAX_VIDEO_SECONDS} seconds.")
+        interval = max(1, int(fps * FRAME_SAMPLE_INTERVAL_SEC))
+        idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx >= int(fps * MAX_VIDEO_SECONDS) + 1:
+                raise ValueError("Video exceeds the scan duration limit.")
+            if idx % interval == 0 and _sharpness(frame) >= MIN_FRAME_SHARPNESS:
+                frame_index = sampled
+                sampled += 1
+                digest = hashlib.sha256(frame.tobytes()).digest()
+                if digest == previous_digest:
+                    repeated += 1
+                    result = dict(previous_result) if previous_result is not None else None
+                else:
+                    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    try:
+                        if MAX_FRAME_EDGE > 0:
+                            img.thumbnail((MAX_FRAME_EDGE, MAX_FRAME_EDGE), Image.Resampling.LANCZOS)
+                        result = _process_single_frame_sync(img, frame_index, f"scan_{frame_index}")
+                    finally:
+                        img.close()
+                    processed += 1
+                    previous_digest = digest
+                    previous_result = dict(result) if result is not None else None
+                if result is not None:
+                    result["_frame_index"] = frame_index
+                    result["temp_id"] = f"scan_{frame_index}"
+                    candidates.append(result)
+            idx += 1
+    finally:
+        cap.release()
+    tracks = _build_garment_tracks(candidates)
+    duplicates = len(candidates) - len(tracks)
+    final = []
+    for result in tracks[:MAX_ITEMS_RETURNED]:
+        public = {k: value for k, value in result.items() if not k.startswith("_")}
+        final.append(DetectedItem(**public))
+    logger.info("[SCAN] sampled=%s processed=%s exact_reused=%s tracks=%s returned=%s seconds=%.1f",
+                sampled, processed, repeated, len(tracks), len(final), time.monotonic() - started)
+    return final, sampled, duplicates
 
 
 async def _run_video_scan_job(job_id: str, tmp_path: str, push_token: Optional[str]):
@@ -592,22 +602,24 @@ async def _run_video_scan_job(job_id: str, tmp_path: str, push_token: Optional[s
     pipeline as before — just no longer blocking the HTTP request.
     """
     try:
-        raw_frames = _extract_candidate_frames(tmp_path)
-        if not raw_frames:
-            _jobs[job_id]["status"] = "error"
-            _jobs[job_id]["error"] = "No usable frames found — video may be too dark, too blurry, or too short."
-            return
-
-        # All sampled frames go through processing now — garment TRACKING
-        # (post-rembg, on the clean crop) does the deduplication, rather
-        # than pre-filtering frames on raw-frame similarity.
-        items = await _process_frames_concurrently(raw_frames)
-        duplicates_removed = max(0, len(raw_frames) - len(items))
+        # One video runs at a time per process, including extraction.
+        # Shield + await prevents cancellation from releasing the lock while
+        # its underlying thread is still processing.
+        async with _scan_lock:
+            work = asyncio.create_task(asyncio.to_thread(_process_video_sync, tmp_path))
+            try:
+                items, frames_scanned, duplicates_removed = await asyncio.shield(work)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await work
+                raise
+        if frames_scanned == 0:
+            raise ValueError("No usable frames found. Try a brighter, steadier scan.")
 
         _jobs[job_id].update({
             "status": "done",
             "items": items,
-            "frames_scanned": len(raw_frames),
+            "frames_scanned": frames_scanned,
             "duplicates_removed": duplicates_removed,
         })
 
@@ -634,6 +646,8 @@ async def _run_video_scan_job(job_id: str, tmp_path: str, push_token: Optional[s
                 data={"job_id": job_id, "type": "video_scan_error"},
             )
     finally:
+        if job_id in _jobs:
+            _jobs[job_id]["finished_at"] = time.time()
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -660,13 +674,27 @@ async def scan_video(
     if file.content_type not in ("video/mp4", "video/quicktime", "video/x-m4v"):
         raise HTTPException(status_code=400, detail="Unsupported video format. Use mp4 or mov.")
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-
+    if sum(job["status"] == "processing" for job in _jobs.values()) >= MAX_PENDING_SCANS:
+        raise HTTPException(status_code=429, detail="Scanner is busy. Please try again shortly.")
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {"status": "processing", "created_at": time.time()}
-    background_tasks.add_task(_run_video_scan_job, job_id, tmp_path, push_token)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+            size = 0
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Video too large. Maximum 50 MB.")
+                tmp.write(chunk)
+        background_tasks.add_task(_run_video_scan_job, job_id, tmp_path, push_token)
+    except BaseException:
+        _jobs.pop(job_id, None)
+        if tmp_path:
+            with suppress(OSError):
+                os.unlink(tmp_path)
+        raise
 
     return ScanJobCreated(job_id=job_id)
 
