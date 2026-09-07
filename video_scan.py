@@ -250,6 +250,54 @@ def _colors_compatible(a: Optional[str], b: Optional[str]) -> bool:
     return False
 
 
+def _local_features(crop):
+    """Bounded, foreground-only descriptors for geometric duplicate verification."""
+    import numpy as np
+    rgba = np.asarray(crop.convert("RGBA").resize((400, 400), Image.Resampling.LANCZOS))
+    mask = (rgba[:, :, 3] >= 200).astype("uint8") * 255
+    # Exclude cutout boundaries, where segmentation artifacts create false details.
+    mask = cv2.erode(mask, np.ones((7, 7), dtype="uint8"))
+    gray = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2GRAY)
+    points, descriptors = cv2.ORB_create(nfeatures=600).detectAndCompute(gray, mask)
+    return (np.float32([point.pt for point in points]).reshape(-1, 2), descriptors)
+
+
+def _geometric_duplicate(a, b):
+    """Require distinctive, spatially distributed details with consistent geometry.
+
+    This is supporting evidence, never proof of physical identity. Missing or
+    textureless crops fail closed. No inference or network calls are made.
+    """
+    import numpy as np
+    if a is None or b is None or a[1] is None or b[1] is None:
+        return False
+    if min(len(a[0]), len(b[0])) < 12:
+        return False
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    def distinctive(source, target):
+        return {m.queryIdx: m.trainIdx for pair in matcher.knnMatch(source, target, k=2)
+                if len(pair) == 2 for m, n in [pair] if m.distance < 0.7 * n.distance}
+    forward, reverse = distinctive(a[1], b[1]), distinctive(b[1], a[1])
+    pairs = [(i, j) for i, j in forward.items() if reverse.get(j) == i]
+    if len(pairs) < 12:
+        return False
+    src = np.float32([a[0][i] for i, _ in pairs])
+    dst = np.float32([b[0][j] for _, j in pairs])
+    transform, inliers = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+    if transform is None or inliers is None or not np.isfinite(transform).all():
+        return False
+    keep = inliers.ravel().astype(bool)
+    if keep.sum() < 12 or keep.mean() < 0.75:
+        return False
+    # A matching logo or a small patch alone must not merge whole garments.
+    for points, all_points in [(src[keep], a[0]), (dst[keep], b[0])]:
+        area = cv2.contourArea(cv2.convexHull(points))
+        total = cv2.contourArea(cv2.convexHull(all_points))
+        if area < 1600 or area < 0.3 * max(total, 1):
+            return False
+    return True
+
+
 def _build_garment_tracks(candidates: List[dict], report=None, scan_id=None) -> List[dict]:
     """
     TEMPORAL GARMENT TRACKING (replaces the old frame-run grouping).
@@ -292,30 +340,49 @@ def _build_garment_tracks(candidates: List[dict], report=None, scan_id=None) -> 
             cat_ok = cand.get("category") == tr["category"]
             col_ok = _colors_compatible(cand.get("color"), tr["color"])
 
-            if gap > TRACK_MAX_FRAME_GAP:
+            timestamp = cand.get("_timestamp_seconds")
+            last_timestamp = tr.get("last_timestamp")
+            elapsed = timestamp - last_timestamp if timestamp is not None and last_timestamp is not None else None
+            method = "crop_hash"
+            if elapsed is not None and (not math.isfinite(elapsed) or elapsed < 0 or elapsed > 3.0):
+                reason = "elapsed_time_outside_track_window"
+            elif gap > TRACK_MAX_FRAME_GAP:
                 reason = f"gap={gap}>{TRACK_MAX_FRAME_GAP}"
             elif not cat_ok:
                 reason = f"category '{cand.get('category')}'!='{tr['category']}'"
             elif not col_ok:
                 reason = f"color '{cand.get('color')}' vs '{tr['color']}'"
             elif dist > TRACK_SIMILARITY_THRESHOLD:
-                reason = f"dist={dist:.1f}>{TRACK_SIMILARITY_THRESHOLD}"
+                # Additional evidence for nearby shoes only; retain all existing
+                # category/color gates and the original fixed anchor.
+                subtype = cand.get("subcategory")
+                geometric = (cand.get("category") == "shoes"
+                             and bool(subtype) and subtype == tr["subcategory"]
+                             and bool(cand.get("color")) and bool(tr["color"])
+                             and elapsed is not None and 0 <= elapsed <= 1.0
+                             and _geometric_duplicate(cand.get("_local_features"), tr["features"]))
+                if geometric:
+                    if best_match is None or dist < best_match[0]:
+                        best_match = (dist, tr, gap, "local_features")
+                    continue
+                reason = f"dist={dist:.1f}>{TRACK_SIMILARITY_THRESHOLD};geometry_unconfirmed"
             else:
                 # valid match — keep the CLOSEST one rather than the first
                 if best_match is None or dist < best_match[0]:
-                    best_match = (dist, tr, gap)
+                    best_match = (dist, tr, gap, method)
                 continue
 
             if best_rejection is None or dist < best_rejection[0]:
                 best_rejection = (dist, reason)
 
         if best_match is not None:
-            dist, tr, gap = best_match
+            dist, tr, gap, method = best_match
             _scan_event(report, scan_id, "tracking", frame_index=cand["_frame_index"],
                         timestamp_seconds=cand.get("_timestamp_seconds"),
-                        decision="merged", track_id=tr["track_id"], distance=float(dist), gap=gap)
+                        decision="merged", track_id=tr["track_id"], distance=float(dist), gap=gap, method=method)
             tr["best"] = better(tr["best"], cand)
             tr["last_frame"] = cand["_frame_index"]
+            tr["last_timestamp"] = cand.get("_timestamp_seconds")
             # NOTE: tr["sig"] is deliberately NOT updated. The track's
             # signature stays anchored to the frame that created it.
             # Updating it per-frame let a single rembg-artifact frame poison
@@ -330,6 +397,9 @@ def _build_garment_tracks(candidates: List[dict], report=None, scan_id=None) -> 
         else:
             tracks.append({
                 "track_id": len(tracks),
+                "last_timestamp": cand.get("_timestamp_seconds"),
+                "subcategory": cand.get("subcategory"),
+                "features": cand.get("_local_features"),
                 "last_frame": cand["_frame_index"],
                 "sig": cand["_crop_sig"],
                 "category": cand.get("category"),
@@ -548,6 +618,7 @@ def _process_single_frame_sync(frame: "Image.Image", frame_index: int, temp_id: 
         "name": classification.get("name") or f"{classification.get('color','')} {classification.get('subcategory','Item')}".strip(),
         "confidence": classification.get("confidence", "medium"),
         "_frame_index": frame_index,             # internal: preserves capture order
+        "_local_features": _local_features(cutout) if classification.get("category") == "shoes" else None,
         "_crop_sig": _crop_signature(cutout),    # internal: fingerprint of the CLEAN crop
         "_sharpness": _sharpness_pil(cutout),    # internal: for picking the best in a track
     }
