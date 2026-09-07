@@ -122,12 +122,77 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn('dist=25.0>20', next(e['reason'] for e in report
                       if e['stage'] == 'tracking' and e['frame_index'] == 1))
 
+    def test_shoe_geometry_recovers_hash_split_with_time_and_metadata_gates(self):
+        env, _, _ = environment([])
+        calls = []
+        env['_geometric_duplicate'] = lambda a, b: calls.append((a, b)) or True
+        def candidate(idx, sig, timestamp, category='shoes', subtype='sneakers', color='black'):
+            return dict(_frame_index=idx, _crop_sig=sig, _sharpness=30,
+                        _timestamp_seconds=timestamp, _local_features=idx,
+                        category=category, color=color, subcategory=subtype)
+        first = candidate(0, 0, 0)
+        report = []
+        result = env['_build_garment_tracks']([first, candidate(1, 25, .5)], report)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(report[1]['method'], 'local_features')
+        for second in [candidate(1, 25, 2), candidate(1, 25, .5, subtype='sandals'),
+                       candidate(1, 25, .5, color='red'), candidate(1, 25, .5, category='top')]:
+            self.assertEqual(len(env['_build_garment_tracks']([first, second])), 2)
+        env['_geometric_duplicate'] = lambda *args: False
+        self.assertEqual(len(env['_build_garment_tracks']([first, candidate(1, 25, .5)])), 2)
+
+    def test_elapsed_time_blocks_merge_even_after_blur_compresses_indices(self):
+        env, _, _ = environment([])
+        candidates = [dict(_frame_index=i, _timestamp_seconds=t, _crop_sig=0,
+                           _sharpness=30, category='shoes', color='black')
+                      for i, t in [(0, 0), (1, 4)]]
+        self.assertEqual(len(env['_build_garment_tracks'](candidates)), 2)
+
     def test_nan_score_is_json_safe_and_rejected(self):
         env, _, _ = environment([Frame(b"a", float('nan'))])
         report = []
         env['_process_video_sync']('unused', True, report)
         json.dumps(report, allow_nan=False)
         self.assertEqual(report[-1]['accepted_frames'], 0)
+
+
+class GeometryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import cv2
+            import numpy as np
+            from PIL import Image
+        except ImportError as exc:
+            raise unittest.SkipTest("Install existing backend dependencies for real geometry tests") from exc
+        cls.np, cls.Image = np, Image
+        cls.env = {'cv2': cv2, 'Image': Image}
+        names = {'_local_features', '_geometric_duplicate'}
+        nodes = [n for n in ast.parse(SOURCE).body if isinstance(n, ast.FunctionDef) and n.name in names]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<actual-geometry>', 'exec'), cls.env)
+
+    def texture(self, seed):
+        rgb = self.np.random.default_rng(seed).integers(0, 256, (320, 320, 3), dtype='uint8')
+        return self.Image.fromarray(rgb).convert('RGBA')
+
+    def match(self, a, b):
+        return self.env['_geometric_duplicate'](self.env['_local_features'](a), self.env['_local_features'](b))
+
+    def test_rotation_of_same_texture(self):
+        original = self.texture(1)
+        self.assertTrue(self.match(original, original.rotate(12)))
+
+    def test_different_textures_remain_separate(self):
+        self.assertFalse(self.match(self.texture(1), self.texture(2)))
+
+    def test_blank_crop_has_no_identity_evidence(self):
+        blank = self.Image.new('RGBA', (320, 320), 'white')
+        self.assertFalse(self.match(blank, blank))
+
+    def test_small_shared_patch_is_insufficient(self):
+        original, other = self.texture(1), self.texture(2)
+        other.paste(original.crop((100, 100, 180, 180)), (100, 100))
+        self.assertFalse(self.match(original, other))
 
 
 if __name__ == '__main__':
