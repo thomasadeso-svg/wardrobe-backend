@@ -1,9 +1,21 @@
 # Video pan diagnostics (review branch only)
 
-This change adds observability, not a recognition fix. Sharpness remains 22,
-sampling remains every 0.5 seconds, and the garment-track threshold remains 20.
-Normal endpoint response shapes and item-selection logic are unchanged. No
-frontend, deployment configuration, requirements or billing settings are changed.
+This branch adds scan diagnostics and a conservative shoe duplicate fallback.
+Sharpness remains 22, sampling remains every 0.5 seconds, and the ordinary
+crop-hash threshold remains 20. If that hash rejects a nearby shoe candidate,
+matching foreground ORB features plus RANSAC geometry can confirm the merge.
+It requires the same nonempty shoe subtype, compatible nonempty color, and a
+last-seen timestamp within one second. At least 12 mutual distinctive matches,
+75% geometric inliers, and broad spatial coverage are required. Features stay
+anchored to the first crop, avoiding frame-to-frame identity drift.
+All tracks also expire after a three-second nominal timestamp gap, including
+when blur rejection compresses accepted-frame numbering.
+
+No extra Claude calls are added. This fixes result grouping after classification;
+it does not save those existing API calls. Small additional local OpenCV work is
+required. Same-model, similar-looking shoes may still be merged; textureless or
+heavily occluded items may still duplicate. This is a draft, not a verified
+production resolution. Endpoint response shapes and dependencies are unchanged.
 
 ## Local diagnostic-only mode
 
@@ -48,7 +60,7 @@ is included in normal-scan classification metadata. Timestamp is decoded index/F
 
 For compatibility, frame_index still numbers sharpness-accepted samples rather
 than all scheduled frames. decoded_frame_index and timestamp_seconds disambiguate
-missing samples without changing existing tracking behavior.
+missing samples. Tracking additionally checks nominal timestamp gaps.
 
 These diagnostics cannot independently prove whether rembg removed a garment
 incorrectly or Claude misclassified it. Comparing the original video with sample
@@ -60,13 +72,19 @@ timestamps is the first step; further controlled cutout inspection may be needed
 python -m unittest discover -s . -p 'test_scan_diagnostics.py' -v
 ```
 
-Eight offline tests exercise functions compiled directly from video_scan.py with
-fake decoder/model dependencies. They cover no-inference diagnostic mode, exact
-reuse labels, timestamps, unchanged accepted-frame numbering, null classifications,
-error redaction/capture cleanup, duration rejection, threshold behavior and NaN
-JSON safety. Syntax compilation also passes. No live API or real OpenCV/model
-integration test was run in the preparation environment. Real-video validation
-remains pending. No CI workflow was added or run.
+Ten offline pipeline/tracker tests and four real OpenCV geometry tests pass.
+Geometry tests cover rotation, unrelated textures, blank crops, and a small
+shared patch. The first ten tests isolate functions with fake inference and
+decoder dependencies; they are not an end-to-end backend import test.
+
+Local fixture check, 2026-09-07: five shoe crops at 10.5, 11, 12, 13, and 14 seconds
+from the supplied IMG_5223.mp4 matched in all ten pairwise geometry comparisons.
+All fifteen shoe-to-top comparisons were rejected (tops at 1.5, 6.5, 7.5 seconds).
+Crops used official u2net weights through OpenCV DNN with rembg preprocessing
+and app framing. This is not Railway's ONNX Runtime engine. These checks validate
+the geometry helper; they do not run live Claude classification or prove the
+full tracking result. Two distinct similar shoes remain an outstanding fixture.
+No paid APIs, production scan, or CI workflow were run for this update.
 
 Do not merge until reviewed. The production branch is main; merging may trigger
 Railway deployment. A draft PR or branch may trigger separately configured preview
