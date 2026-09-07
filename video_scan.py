@@ -10,6 +10,7 @@ import time
 import uuid
 import hashlib
 import logging
+import math
 from contextlib import suppress
 import asyncio
 import tempfile
@@ -94,7 +95,15 @@ def _check_rate_limit(ip: str):
     _request_log[ip].append(now)
 
 
-claude_client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env, same as rest of backend
+claude_client = None  # Created only for actual classification, never diagnostic-only runs.
+
+
+def _scan_event(report, scan_id, stage, **fields):
+    """Metadata only: never log images, tokens, prompts, paths or API responses."""
+    event = {"scan_id": scan_id, "stage": stage, **fields}
+    if report is not None:
+        report.append(event)
+    logger.info("[SCAN_DIAG] %s", json.dumps(event, allow_nan=False))
 
 # ── Background job store ─────────────────────────────────────────────────
 # Video scans now run as background jobs instead of blocking the request:
@@ -241,7 +250,55 @@ def _colors_compatible(a: Optional[str], b: Optional[str]) -> bool:
     return False
 
 
-def _build_garment_tracks(candidates: List[dict]) -> List[dict]:
+def _local_features(crop):
+    """Bounded, foreground-only descriptors for geometric duplicate verification."""
+    import numpy as np
+    rgba = np.asarray(crop.convert("RGBA").resize((400, 400), Image.Resampling.LANCZOS))
+    mask = (rgba[:, :, 3] >= 200).astype("uint8") * 255
+    # Exclude cutout boundaries, where segmentation artifacts create false details.
+    mask = cv2.erode(mask, np.ones((7, 7), dtype="uint8"))
+    gray = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2GRAY)
+    points, descriptors = cv2.ORB_create(nfeatures=600).detectAndCompute(gray, mask)
+    return (np.float32([point.pt for point in points]).reshape(-1, 2), descriptors)
+
+
+def _geometric_duplicate(a, b):
+    """Require distinctive, spatially distributed details with consistent geometry.
+
+    This is supporting evidence, never proof of physical identity. Missing or
+    textureless crops fail closed. No inference or network calls are made.
+    """
+    import numpy as np
+    if a is None or b is None or a[1] is None or b[1] is None:
+        return False
+    if min(len(a[0]), len(b[0])) < 12:
+        return False
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    def distinctive(source, target):
+        return {m.queryIdx: m.trainIdx for pair in matcher.knnMatch(source, target, k=2)
+                if len(pair) == 2 for m, n in [pair] if m.distance < 0.7 * n.distance}
+    forward, reverse = distinctive(a[1], b[1]), distinctive(b[1], a[1])
+    pairs = [(i, j) for i, j in forward.items() if reverse.get(j) == i]
+    if len(pairs) < 12:
+        return False
+    src = np.float32([a[0][i] for i, _ in pairs])
+    dst = np.float32([b[0][j] for _, j in pairs])
+    transform, inliers = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+    if transform is None or inliers is None or not np.isfinite(transform).all():
+        return False
+    keep = inliers.ravel().astype(bool)
+    if keep.sum() < 12 or keep.mean() < 0.75:
+        return False
+    # A matching logo or a small patch alone must not merge whole garments.
+    for points, all_points in [(src[keep], a[0]), (dst[keep], b[0])]:
+        area = cv2.contourArea(cv2.convexHull(points))
+        total = cv2.contourArea(cv2.convexHull(all_points))
+        if area < 1600 or area < 0.3 * max(total, 1):
+            return False
+    return True
+
+
+def _build_garment_tracks(candidates: List[dict], report=None, scan_id=None) -> List[dict]:
     """
     TEMPORAL GARMENT TRACKING (replaces the old frame-run grouping).
 
@@ -283,27 +340,49 @@ def _build_garment_tracks(candidates: List[dict]) -> List[dict]:
             cat_ok = cand.get("category") == tr["category"]
             col_ok = _colors_compatible(cand.get("color"), tr["color"])
 
-            if gap > TRACK_MAX_FRAME_GAP:
+            timestamp = cand.get("_timestamp_seconds")
+            last_timestamp = tr.get("last_timestamp")
+            elapsed = timestamp - last_timestamp if timestamp is not None and last_timestamp is not None else None
+            method = "crop_hash"
+            if elapsed is not None and (not math.isfinite(elapsed) or elapsed < 0 or elapsed > 3.0):
+                reason = "elapsed_time_outside_track_window"
+            elif gap > TRACK_MAX_FRAME_GAP:
                 reason = f"gap={gap}>{TRACK_MAX_FRAME_GAP}"
             elif not cat_ok:
                 reason = f"category '{cand.get('category')}'!='{tr['category']}'"
             elif not col_ok:
                 reason = f"color '{cand.get('color')}' vs '{tr['color']}'"
             elif dist > TRACK_SIMILARITY_THRESHOLD:
-                reason = f"dist={dist:.1f}>{TRACK_SIMILARITY_THRESHOLD}"
+                # Additional evidence for nearby shoes only; retain all existing
+                # category/color gates and the original fixed anchor.
+                subtype = cand.get("subcategory")
+                geometric = (cand.get("category") == "shoes"
+                             and bool(subtype) and subtype == tr["subcategory"]
+                             and bool(cand.get("color")) and bool(tr["color"])
+                             and elapsed is not None and 0 <= elapsed <= 1.0
+                             and _geometric_duplicate(cand.get("_local_features"), tr["features"]))
+                if geometric:
+                    if best_match is None or dist < best_match[0]:
+                        best_match = (dist, tr, gap, "local_features")
+                    continue
+                reason = f"dist={dist:.1f}>{TRACK_SIMILARITY_THRESHOLD};geometry_unconfirmed"
             else:
                 # valid match — keep the CLOSEST one rather than the first
                 if best_match is None or dist < best_match[0]:
-                    best_match = (dist, tr, gap)
+                    best_match = (dist, tr, gap, method)
                 continue
 
             if best_rejection is None or dist < best_rejection[0]:
                 best_rejection = (dist, reason)
 
         if best_match is not None:
-            dist, tr, gap = best_match
+            dist, tr, gap, method = best_match
+            _scan_event(report, scan_id, "tracking", frame_index=cand["_frame_index"],
+                        timestamp_seconds=cand.get("_timestamp_seconds"),
+                        decision="merged", track_id=tr["track_id"], distance=float(dist), gap=gap, method=method)
             tr["best"] = better(tr["best"], cand)
             tr["last_frame"] = cand["_frame_index"]
+            tr["last_timestamp"] = cand.get("_timestamp_seconds")
             # NOTE: tr["sig"] is deliberately NOT updated. The track's
             # signature stays anchored to the frame that created it.
             # Updating it per-frame let a single rembg-artifact frame poison
@@ -317,12 +396,20 @@ def _build_garment_tracks(candidates: List[dict]) -> List[dict]:
                       f"-> MERGED (gap={gap}, dist={dist:.1f})")
         else:
             tracks.append({
+                "track_id": len(tracks),
+                "last_timestamp": cand.get("_timestamp_seconds"),
+                "subcategory": cand.get("subcategory"),
+                "features": cand.get("_local_features"),
                 "last_frame": cand["_frame_index"],
                 "sig": cand["_crop_sig"],
                 "category": cand.get("category"),
                 "color": cand.get("color"),
                 "best": cand,
             })
+            _scan_event(report, scan_id, "tracking", frame_index=cand["_frame_index"],
+                        timestamp_seconds=cand.get("_timestamp_seconds"),
+                        decision="new_track", track_id=tracks[-1]["track_id"],
+                        reason=best_rejection[1] if best_rejection else "first_track")
             if TRACK_DEBUG:
                 if best_rejection:
                     d, reason = best_rejection
@@ -335,6 +422,10 @@ def _build_garment_tracks(candidates: List[dict]) -> List[dict]:
     if TRACK_DEBUG:
         print(f"[TRACK] === {len(candidates)} candidates -> {len(tracks)} garment tracks ===")
 
+    for tr in tracks:
+        _scan_event(report, scan_id, "track_result", track_id=tr["track_id"],
+                    selected_frame_index=tr["best"]["_frame_index"],
+                    returned=tr["track_id"] < MAX_ITEMS_RETURNED)
     return [tr["best"] for tr in tracks]
 
 
@@ -396,6 +487,9 @@ def _classify_with_claude(img: "Image.Image") -> dict:
     keeps WardrobeItem fields consistent whether an item came from a
     single photo or a video scan.
     """
+    global claude_client
+    if claude_client is None:
+        claude_client = anthropic.Anthropic()
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     img_b64 = base64.b64encode(buf.getvalue()).decode()
@@ -524,23 +618,27 @@ def _process_single_frame_sync(frame: "Image.Image", frame_index: int, temp_id: 
         "name": classification.get("name") or f"{classification.get('color','')} {classification.get('subcategory','Item')}".strip(),
         "confidence": classification.get("confidence", "medium"),
         "_frame_index": frame_index,             # internal: preserves capture order
+        "_local_features": _local_features(cutout) if classification.get("category") == "shoes" else None,
         "_crop_sig": _crop_signature(cutout),    # internal: fingerprint of the CLEAN crop
         "_sharpness": _sharpness_pil(cutout),    # internal: for picking the best in a track
     }
 
 
-def _process_video_sync(video_path):
+def _process_video_sync(video_path, diagnostic_only=False, report=None, scan_id=None):
     """Stream sampled frames: only one raw frame is retained at a time.
 
     Exact repeated samples reuse the previous result before rembg/Claude.
     They still enter tracking at their original index, preserving track gaps.
     Near-duplicate and angle matching remain the existing crop tracker.
     """
+    scan_id = scan_id or str(uuid.uuid4())
     cap = cv2.VideoCapture(video_path)
     candidates = []
     sampled = 0
     processed = 0
     repeated = 0
+    opportunities = 0
+    sharpness_rejected = 0
     previous_digest = None
     previous_result = None
     started = time.monotonic()
@@ -552,6 +650,9 @@ def _process_video_sync(video_path):
         if count / fps > MAX_VIDEO_SECONDS:
             raise ValueError(f"Video too long. Maximum {MAX_VIDEO_SECONDS} seconds.")
         interval = max(1, int(fps * FRAME_SAMPLE_INTERVAL_SEC))
+        _scan_event(report, scan_id, "video", fps=float(fps),
+                    reported_frame_count=float(count), sample_interval_frames=interval,
+                    sharpness_threshold=MIN_FRAME_SHARPNESS, diagnostic_only=diagnostic_only)
         idx = 0
         while True:
             ok, frame = cap.read()
@@ -559,11 +660,26 @@ def _process_video_sync(video_path):
                 break
             if idx >= int(fps * MAX_VIDEO_SECONDS) + 1:
                 raise ValueError("Video exceeds the scan duration limit.")
-            if idx % interval == 0 and _sharpness(frame) >= MIN_FRAME_SHARPNESS:
+            if idx % interval == 0:
+                opportunities += 1
+                score = float(_sharpness(frame))
+                accepted = score >= MIN_FRAME_SHARPNESS
+                _scan_event(report, scan_id, "sampling", decoded_frame_index=idx,
+                            timestamp_seconds=round(idx / fps, 4), sharpness=score if math.isfinite(score) else None,
+                            decision="accepted" if accepted else "sharpness_rejected",
+                            frame_index=sampled if accepted else None)
+                if not accepted:
+                    sharpness_rejected += 1
+                    idx += 1
+                    continue
                 frame_index = sampled
                 sampled += 1
+                if diagnostic_only:
+                    idx += 1
+                    continue
                 digest = hashlib.sha256(frame.tobytes()).digest()
-                if digest == previous_digest:
+                is_reuse = digest == previous_digest
+                if is_reuse:
                     repeated += 1
                     result = dict(previous_result) if previous_result is not None else None
                 else:
@@ -571,20 +687,38 @@ def _process_video_sync(video_path):
                     try:
                         if MAX_FRAME_EDGE > 0:
                             img.thumbnail((MAX_FRAME_EDGE, MAX_FRAME_EDGE), Image.Resampling.LANCZOS)
-                        result = _process_single_frame_sync(img, frame_index, f"scan_{frame_index}")
+                        try:
+                            result = _process_single_frame_sync(img, frame_index, f"scan_{frame_index}")
+                        except Exception as exc:
+                            _scan_event(report, scan_id, "processing", frame_index=frame_index,
+                                        timestamp_seconds=round(idx / fps, 4),
+                                        decision="error", error_type=type(exc).__name__)
+                            raise
                     finally:
                         img.close()
                     processed += 1
                     previous_digest = digest
                     previous_result = dict(result) if result is not None else None
+                _scan_event(report, scan_id, "classification", frame_index=frame_index,
+                            timestamp_seconds=round(idx / fps, 4),
+                            source="exact_reuse" if is_reuse else "processed",
+                            decision="accepted" if result is not None else "no_category_or_invalid_json",
+                            category=result.get("category") if result else None,
+                            subcategory=result.get("subcategory") if result else None)
                 if result is not None:
                     result["_frame_index"] = frame_index
+                    result["_timestamp_seconds"] = round(idx / fps, 4)
                     result["temp_id"] = f"scan_{frame_index}"
                     candidates.append(result)
             idx += 1
     finally:
         cap.release()
-    tracks = _build_garment_tracks(candidates)
+    _scan_event(report, scan_id, "sampling_summary", decoded_frames=idx,
+                sampling_opportunities=opportunities, accepted_frames=sampled,
+                sharpness_rejected=sharpness_rejected, diagnostic_only=diagnostic_only)
+    if diagnostic_only:
+        return [], sampled, 0
+    tracks = _build_garment_tracks(candidates, report=report, scan_id=scan_id)
     duplicates = len(candidates) - len(tracks)
     final = []
     for result in tracks[:MAX_ITEMS_RETURNED]:
@@ -606,7 +740,7 @@ async def _run_video_scan_job(job_id: str, tmp_path: str, push_token: Optional[s
         # Shield + await prevents cancellation from releasing the lock while
         # its underlying thread is still processing.
         async with _scan_lock:
-            work = asyncio.create_task(asyncio.to_thread(_process_video_sync, tmp_path))
+            work = asyncio.create_task(asyncio.to_thread(_process_video_sync, tmp_path, scan_id=job_id))
             try:
                 items, frames_scanned, duplicates_removed = await asyncio.shield(work)
             except asyncio.CancelledError:
