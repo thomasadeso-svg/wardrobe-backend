@@ -298,6 +298,30 @@ def _geometric_duplicate(a, b):
     return True
 
 
+def _foreground_palette(crop):
+    """Small normalized colour histogram of opaque garment pixels, not background."""
+    import numpy as np
+    rgba = np.asarray(crop.convert("RGBA").resize((200, 200), Image.Resampling.LANCZOS))
+    mask = (rgba[:, :, 3] >= 200).astype("uint8") * 255
+    if np.count_nonzero(mask) < 100:
+        return None
+    lab = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2LAB)
+    histogram = cv2.calcHist([lab], [0, 1, 2], mask, [8, 8, 8], [0, 256] * 3)
+    return histogram / max(float(histogram.sum()), 1.0)
+
+
+def _palette_matches(a, b):
+    if a is None or b is None:
+        return False
+    distance = float(cv2.compareHist(a, b, cv2.HISTCMP_BHATTACHARYYA))
+    return math.isfinite(distance) and distance <= 0.35
+
+
+def _candidate_view(cand):
+    return {"sig": cand["_crop_sig"], "features": cand.get("_local_features"),
+            "palette": cand.get("_palette"), "frame_index": cand["_frame_index"]}
+
+
 def _build_garment_tracks(candidates: List[dict], report=None, scan_id=None) -> List[dict]:
     """
     TEMPORAL GARMENT TRACKING (replaces the old frame-run grouping).
@@ -336,53 +360,83 @@ def _build_garment_tracks(candidates: List[dict], report=None, scan_id=None) -> 
         # never reached their real match and spawned duplicate tracks.
         for tr in tracks:
             gap = cand["_frame_index"] - tr["last_frame"]
-            dist = _crop_distance(cand["_crop_sig"], tr["sig"])
+            anchor_distance = _crop_distance(cand["_crop_sig"], tr["sig"])
+            dist = anchor_distance
             cat_ok = cand.get("category") == tr["category"]
             col_ok = _colors_compatible(cand.get("color"), tr["color"])
-
+            subtype = cand.get("subcategory")
+            subtype_ok = bool(subtype) and subtype == tr["subcategory"]
             timestamp = cand.get("_timestamp_seconds")
             last_timestamp = tr.get("last_timestamp")
             elapsed = timestamp - last_timestamp if timestamp is not None and last_timestamp is not None else None
             method = "crop_hash"
+            reference_frame = tr["views"][0]["frame_index"]
+            reason = None
             if elapsed is not None and (not math.isfinite(elapsed) or elapsed < 0 or elapsed > 3.0):
                 reason = "elapsed_time_outside_track_window"
             elif gap > TRACK_MAX_FRAME_GAP:
                 reason = f"gap={gap}>{TRACK_MAX_FRAME_GAP}"
             elif not cat_ok:
                 reason = f"category '{cand.get('category')}'!='{tr['category']}'"
-            elif not col_ok:
-                reason = f"color '{cand.get('color')}' vs '{tr['color']}'"
-            elif dist > TRACK_SIMILARITY_THRESHOLD:
-                # Additional evidence for nearby shoes only; retain all existing
-                # category/color gates and the original fixed anchor.
-                subtype = cand.get("subcategory")
-                geometric = (cand.get("category") == "shoes"
-                             and bool(subtype) and subtype == tr["subcategory"]
-                             and bool(cand.get("color")) and bool(tr["color"])
-                             and elapsed is not None and 0 <= elapsed <= 1.0
-                             and _geometric_duplicate(cand.get("_local_features"), tr["features"]))
-                if geometric:
-                    if best_match is None or dist < best_match[0]:
-                        best_match = (dist, tr, gap, "local_features")
-                    continue
-                reason = f"dist={dist:.1f}>{TRACK_SIMILARITY_THRESHOLD};geometry_unconfirmed"
+            elif cand.get("subcategory") and tr["subcategory"] and not subtype_ok:
+                reason = "subcategory_mismatch"
             else:
-                # valid match — keep the CLOSEST one rather than the first
+                # Extra references must have been verified against the original
+                # anchor. They cannot admit more references through chain matching.
+                if subtype_ok and elapsed is not None and 0 <= elapsed <= 1.0:
+                    for view in tr["views"][1:]:
+                        d = _crop_distance(cand["_crop_sig"], view["sig"])
+                        if d < dist and _palette_matches(cand.get("_palette"), view["palette"]):
+                            dist, reference_frame = d, view["frame_index"]
+                            method = "verified_view_hash"
+                if col_ok and dist <= TRACK_SIMILARITY_THRESHOLD:
+                    pass
+                else:
+                    # Colour words are fallible. Overriding them requires BOTH
+                    # matching actual foreground colours and geometric evidence.
+                    verified = False
+                    if subtype_ok and elapsed is not None and 0 <= elapsed <= 1.0:
+                        for view in tr["views"]:
+                            if (_palette_matches(cand.get("_palette"), view["palette"])
+                                    and _geometric_duplicate(cand.get("_local_features"), view["features"])):
+                                verified = True
+                                method = "local_features" if col_ok else "visual_colour_override"
+                                reference_frame = view["frame_index"]
+                                break
+                    if not verified:
+                        reason = (f"color '{cand.get('color')}' vs '{tr['color']}';visual_unconfirmed"
+                                  if not col_ok else f"dist={dist:.1f}>{TRACK_SIMILARITY_THRESHOLD};visual_unconfirmed")
+            if reason is None:
                 if best_match is None or dist < best_match[0]:
-                    best_match = (dist, tr, gap, method)
+                    best_match = (dist, tr, gap, method, reference_frame)
                 continue
+            _scan_event(report, scan_id, "track_comparison", frame_index=cand["_frame_index"],
+                        track_id=tr["track_id"], decision="rejected", reason=reason,
+                        anchor_distance=float(anchor_distance), best_distance=float(dist),
+                        colour_labels_compatible=col_ok, reference_frame_index=reference_frame)
 
             if best_rejection is None or dist < best_rejection[0]:
                 best_rejection = (dist, reason)
 
         if best_match is not None:
-            dist, tr, gap, method = best_match
+            dist, tr, gap, method, reference_frame = best_match
             _scan_event(report, scan_id, "tracking", frame_index=cand["_frame_index"],
                         timestamp_seconds=cand.get("_timestamp_seconds"),
-                        decision="merged", track_id=tr["track_id"], distance=float(dist), gap=gap, method=method)
+                        decision="merged", track_id=tr["track_id"], distance=float(dist), gap=gap, method=method,
+                        reference_frame_index=reference_frame)
             tr["best"] = better(tr["best"], cand)
             tr["last_frame"] = cand["_frame_index"]
             tr["last_timestamp"] = cand.get("_timestamp_seconds")
+            # Keep at most three views, always including the first. Admit new
+            # references only by direct anchor hash + actual colour agreement.
+            # A rescue via another view or geometry cannot extend the chain.
+            anchor = tr["views"][0]
+            anchor_distance = _crop_distance(cand["_crop_sig"], anchor["sig"])
+            if (cand.get("subcategory") and cand.get("subcategory") == tr["subcategory"]
+                    and 4 <= anchor_distance <= TRACK_SIMILARITY_THRESHOLD
+                    and _palette_matches(cand.get("_palette"), anchor["palette"])):
+                tr["views"].append(_candidate_view(cand))
+                tr["views"] = tr["views"][:1] + tr["views"][-2:]
             # NOTE: tr["sig"] is deliberately NOT updated. The track's
             # signature stays anchored to the frame that created it.
             # Updating it per-frame let a single rembg-artifact frame poison
@@ -399,7 +453,7 @@ def _build_garment_tracks(candidates: List[dict], report=None, scan_id=None) -> 
                 "track_id": len(tracks),
                 "last_timestamp": cand.get("_timestamp_seconds"),
                 "subcategory": cand.get("subcategory"),
-                "features": cand.get("_local_features"),
+                "views": [_candidate_view(cand)],
                 "last_frame": cand["_frame_index"],
                 "sig": cand["_crop_sig"],
                 "category": cand.get("category"),
@@ -618,7 +672,8 @@ def _process_single_frame_sync(frame: "Image.Image", frame_index: int, temp_id: 
         "name": classification.get("name") or f"{classification.get('color','')} {classification.get('subcategory','Item')}".strip(),
         "confidence": classification.get("confidence", "medium"),
         "_frame_index": frame_index,             # internal: preserves capture order
-        "_local_features": _local_features(cutout) if classification.get("category") == "shoes" else None,
+        "_local_features": _local_features(cutout),
+        "_palette": _foreground_palette(cutout),
         "_crop_sig": _crop_signature(cutout),    # internal: fingerprint of the CLEAN crop
         "_sharpness": _sharpness_pil(cutout),    # internal: for picking the best in a track
     }

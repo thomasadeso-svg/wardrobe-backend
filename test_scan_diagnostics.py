@@ -45,9 +45,10 @@ def environment(frames, fps=2, count=None):
         MAX_FRAME_EDGE=0, MAX_ITEMS_RETURNED=20, TRACK_MAX_FRAME_GAP=6,
         TRACK_SIMILARITY_THRESHOLD=20, TRACK_DEBUG=False,
         _sharpness=lambda f: f.score, _process_single_frame_sync=process,
+        _palette_matches=lambda a, b: a is not None and a == b,
         _crop_distance=lambda a, b: abs(a-b), _colors_compatible=lambda a, b: a == b,
         DetectedItem=lambda **kw: kw)
-    names = {"_scan_event", "_process_video_sync", "_build_garment_tracks"}
+    names = {"_scan_event", "_process_video_sync", "_build_garment_tracks", "_candidate_view"}
     nodes = [n for n in ast.parse(SOURCE).body if isinstance(n, ast.FunctionDef) and n.name in names]
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<actual-source>", "exec"), env)
     return env, calls, cap
@@ -128,7 +129,7 @@ class DiagnosticsTests(unittest.TestCase):
         env['_geometric_duplicate'] = lambda a, b: calls.append((a, b)) or True
         def candidate(idx, sig, timestamp, category='shoes', subtype='sneakers', color='black'):
             return dict(_frame_index=idx, _crop_sig=sig, _sharpness=30,
-                        _timestamp_seconds=timestamp, _local_features=idx,
+                        _timestamp_seconds=timestamp, _local_features=idx, _palette="same",
                         category=category, color=color, subcategory=subtype)
         first = candidate(0, 0, 0)
         report = []
@@ -136,7 +137,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(report[1]['method'], 'local_features')
         for second in [candidate(1, 25, 2), candidate(1, 25, .5, subtype='sandals'),
-                       candidate(1, 25, .5, color='red'), candidate(1, 25, .5, category='top')]:
+                       candidate(1, 25, .5, category='top')]:
             self.assertEqual(len(env['_build_garment_tracks']([first, second])), 2)
         env['_geometric_duplicate'] = lambda *args: False
         self.assertEqual(len(env['_build_garment_tracks']([first, candidate(1, 25, .5)])), 2)
@@ -146,6 +147,55 @@ class DiagnosticsTests(unittest.TestCase):
         candidates = [dict(_frame_index=i, _timestamp_seconds=t, _crop_sig=0,
                            _sharpness=30, category='shoes', color='black')
                       for i, t in [(0, 0), (1, 4)]]
+        self.assertEqual(len(env['_build_garment_tracks'](candidates)), 2)
+
+    def test_colour_word_override_requires_geometry_and_actual_palette(self):
+        env, _, _ = environment([])
+        def candidate(i, color, palette):
+            return dict(_frame_index=i, _timestamp_seconds=i*.5, _crop_sig=i*11,
+                        _sharpness=30, _local_features=i, _palette=palette,
+                        category='shoes', subcategory='sneakers', color=color)
+        a, b = candidate(0, 'grey', 'same'), candidate(1, 'white', 'same')
+        env['_geometric_duplicate'] = lambda *args: True
+        report = []
+        self.assertEqual(len(env['_build_garment_tracks']([a, b], report)), 1)
+        self.assertEqual(report[1]['method'], 'visual_colour_override')
+        b['_palette'] = 'different'
+        self.assertEqual(len(env['_build_garment_tracks']([a, b])), 2)
+        b['_palette'] = 'same'
+        env['_geometric_duplicate'] = lambda *args: False
+        self.assertEqual(len(env['_build_garment_tracks']([a, b])), 2)
+
+    def test_polo_can_match_verified_view_without_unbounded_drift(self):
+        env, _, _ = environment([])
+        env['_geometric_duplicate'] = lambda *args: False
+        def candidate(i, sig):
+            return dict(_frame_index=i, _timestamp_seconds=i*.5, _crop_sig=sig,
+                        _sharpness=30, _palette='burgundy', category='top',
+                        subcategory='polo shirt', color='burgundy')
+        # An anchor-approved view at distance 13 bridges the rejected distance 27.
+        # That rescued view cannot become a new reference and bridge distance 45.
+        report = []
+        result = env['_build_garment_tracks']([candidate(0,0), candidate(1,13),
+                                              candidate(2,27), candidate(3,45)], report)
+        self.assertEqual(len(result), 2)
+        merged = next(e for e in report if e['stage']=='tracking' and e['frame_index']==2)
+        self.assertEqual(merged['method'], 'verified_view_hash')
+        self.assertEqual(merged['reference_frame_index'], 1)
+
+    def test_polo_geometry_fallback_is_enabled(self):
+        env, _, _ = environment([])
+        env['_geometric_duplicate'] = lambda *args: True
+        candidates = [dict(_frame_index=i, _timestamp_seconds=i*.5, _crop_sig=i*27,
+                           _sharpness=30, _palette='burgundy', _local_features=i,
+                           category='top', subcategory='polo shirt', color='burgundy') for i in range(2)]
+        self.assertEqual(len(env['_build_garment_tracks'](candidates)), 1)
+
+    def test_distinct_subtypes_do_not_merge_even_with_close_hashes(self):
+        env, _, _ = environment([])
+        candidates = [dict(_frame_index=i, _timestamp_seconds=i*.5, _crop_sig=0,
+                           _sharpness=30, category='top', color='black', subcategory=sub)
+                      for i, sub in enumerate(['polo shirt', 'tank top'])]
         self.assertEqual(len(env['_build_garment_tracks'](candidates)), 2)
 
     def test_nan_score_is_json_safe_and_rejected(self):
@@ -166,8 +216,8 @@ class GeometryTests(unittest.TestCase):
         except ImportError as exc:
             raise unittest.SkipTest("Install existing backend dependencies for real geometry tests") from exc
         cls.np, cls.Image = np, Image
-        cls.env = {'cv2': cv2, 'Image': Image}
-        names = {'_local_features', '_geometric_duplicate'}
+        cls.env = {'cv2': cv2, 'Image': Image, 'math': math}
+        names = {'_local_features', '_geometric_duplicate', '_foreground_palette', '_palette_matches'}
         nodes = [n for n in ast.parse(SOURCE).body if isinstance(n, ast.FunctionDef) and n.name in names]
         exec(compile(ast.Module(body=nodes, type_ignores=[]), '<actual-geometry>', 'exec'), cls.env)
 
@@ -188,6 +238,16 @@ class GeometryTests(unittest.TestCase):
     def test_blank_crop_has_no_identity_evidence(self):
         blank = self.Image.new('RGBA', (320, 320), 'white')
         self.assertFalse(self.match(blank, blank))
+
+    def test_foreground_palette_ignores_transparent_background(self):
+        a = self.Image.new('RGBA', (320,320), (255,255,255,0))
+        b = self.Image.new('RGBA', (320,320), (0,0,0,0))
+        patch = self.Image.new('RGBA', (200,200), 'red')
+        a.paste(patch,(60,60)); b.paste(patch,(60,60))
+        palette = self.env['_foreground_palette']
+        self.assertTrue(self.env['_palette_matches'](palette(a),palette(b)))
+        b.paste(self.Image.new('RGBA',(200,200),'blue'),(60,60))
+        self.assertFalse(self.env['_palette_matches'](palette(a),palette(b)))
 
     def test_small_shared_patch_is_insufficient(self):
         original, other = self.texture(1), self.texture(2)
