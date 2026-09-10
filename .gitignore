@@ -1,3 +1,7 @@
 .venv-check/
+.venv-release-tools/
+.venv-release/
+.release-python/
+.release-cache/
 __pycache__/
 *.pyc

@@ -179,7 +179,7 @@ class OutfitTests(unittest.TestCase):
         namespace = {'asyncio': asyncio, 're': re, 'json': json, 'client': client, 'HTTPException': ValueError}
         exec(compile(ast.Module(body=[route], type_ignores=[]), 'backend-main.py', 'exec'), namespace)
         result = asyncio.run(namespace['generate_outfit'](self.request()))
-        client.with_options.assert_called_once_with(max_retries=0, timeout=18.0)
+        client.with_options.assert_called_once_with(max_retries=0, timeout=10.0)
         self.assertEqual(client.with_options.return_value.messages.create.call_count, 1)
         self.assert_complete(result, self.request())
 

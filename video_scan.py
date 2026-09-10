@@ -479,7 +479,7 @@ def _build_garment_tracks(candidates: List[dict], report=None, scan_id=None) -> 
     for tr in tracks:
         _scan_event(report, scan_id, "track_result", track_id=tr["track_id"],
                     selected_frame_index=tr["best"]["_frame_index"],
-                    returned=tr["track_id"] < MAX_ITEMS_RETURNED)
+                    returned=True)
     return [tr["best"] for tr in tracks]
 
 
@@ -651,10 +651,15 @@ def _process_single_frame_sync(frame: "Image.Image", frame_index: int, temp_id: 
     to the client.
     """
     cutout = _remove_background(frame)
+    # Empty segmentation is not a garment: avoid an unnecessary classifier call.
+    if cutout.mode == 'RGBA' and cutout.getchannel('A').getbbox() is None:
+        logger.info('scan_frame_cost rembg_calls=1 classification_calls=0 reason=empty_cutout')
+        return None
     cutout = _frame_cutout(cutout)  # normalize: crop tight, center, pad into uniform square
 
     classification = _classify_with_claude(cutout)
-    if not classification.get("category"):
+    logger.info('scan_frame_cost rembg_calls=1 classification_calls=1')
+    if classification.get("category") not in {'top', 'bottom', 'dress', 'shoes', 'outerwear', 'bag', 'jewelry', 'accessory'}:
         return None
 
     buf = io.BytesIO()
@@ -696,6 +701,7 @@ def _process_video_sync(video_path, diagnostic_only=False, report=None, scan_id=
     sharpness_rejected = 0
     previous_digest = None
     previous_result = None
+    exact_results = {}  # Scan-local, bounded by the <=20-second sampled video.
     started = time.monotonic()
     try:
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -733,10 +739,11 @@ def _process_video_sync(video_path, diagnostic_only=False, report=None, scan_id=
                     idx += 1
                     continue
                 digest = hashlib.sha256(frame.tobytes()).digest()
-                is_reuse = digest == previous_digest
+                is_reuse = digest in exact_results
                 if is_reuse:
                     repeated += 1
-                    result = dict(previous_result) if previous_result is not None else None
+                    cached = exact_results[digest]
+                    result = dict(cached) if cached is not None else None
                 else:
                     img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     try:
@@ -754,6 +761,7 @@ def _process_video_sync(video_path, diagnostic_only=False, report=None, scan_id=
                     processed += 1
                     previous_digest = digest
                     previous_result = dict(result) if result is not None else None
+                    exact_results[digest] = previous_result
                 _scan_event(report, scan_id, "classification", frame_index=frame_index,
                             timestamp_seconds=round(idx / fps, 4),
                             source="exact_reuse" if is_reuse else "processed",
@@ -776,7 +784,7 @@ def _process_video_sync(video_path, diagnostic_only=False, report=None, scan_id=
     tracks = _build_garment_tracks(candidates, report=report, scan_id=scan_id)
     duplicates = len(candidates) - len(tracks)
     final = []
-    for result in tracks[:MAX_ITEMS_RETURNED]:
+    for result in tracks:
         public = {k: value for k, value in result.items() if not k.startswith("_")}
         final.append(DetectedItem(**public))
     logger.info("[SCAN] sampled=%s processed=%s exact_reused=%s tracks=%s returned=%s seconds=%.1f",

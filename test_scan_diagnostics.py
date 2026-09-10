@@ -55,6 +55,13 @@ def environment(frames, fps=2, count=None):
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_nonadjacent_exact_frames_reuse_processing_without_dropping_distinct_frame(self):
+        env, calls, _ = environment([Frame(b'a', 30), Frame(b'b', 30), Frame(b'a', 30)])
+        report = []
+        env['_process_video_sync']('unused', False, report)
+        self.assertEqual(len(calls), 2)  # Two rembg/classification pipelines instead of three.
+        self.assertEqual(sum(e.get('source') == 'exact_reuse' for e in report), 1)
+
     def test_diagnostic_never_processes_or_tracks(self):
         env, calls, cap = environment([Frame(b"a", 10), Frame(b"b", 22), Frame(b"c", 30)])
         def forbidden(*args, **kwargs):

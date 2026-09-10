@@ -44,6 +44,7 @@ async def root():
         "status": "live",
         "service": "styligma-v2",
         "outfit_api_version": 2,
+        "compatibility_api_version": 1,
         "outfit_features": ["batches", "exact_item_anchor", "hot_outerwear_anchor"],
         "endpoints": [
             "/remove-background",
@@ -173,7 +174,7 @@ async def generate_outfit(request: dict):
     from outfit_engine import build_batch
 
     def ask_ai(prompt):
-        response = client.with_options(max_retries=0, timeout=18.0).messages.create(
+        response = client.with_options(max_retries=0, timeout=10.0).messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1400 if request.get("batch_size", 1) != 1 else 500,
             messages=[{"role": "user", "content": prompt}],
@@ -192,118 +193,11 @@ async def generate_outfit(request: dict):
 
 @app.post("/match-item")
 async def match_item(request: dict):
-    new_item = request.get("new_item", {})
-    wardrobe = request.get("wardrobe", [])
-    occasion = request.get("occasion", "casual")
-
-    if not new_item or len(wardrobe) < 1:
-        return {
-            "matches": [],
-            "outfits": [],
-            "verdict": "Add more items to your wardrobe first.",
-            "match_count": 0,
-        }
-
-    items_list = []
-    for i, item in enumerate(wardrobe):
-        items_list.append(
-            f"[{i}] {item.get('name', 'Item')} — {item.get('category', '?')}, "
-            f"Color: {item.get('color', '?')}, Style: {item.get('style', '?')}, "
-            f"Sub: {item.get('subcategory', '?')}"
-        )
-    items_text = "\n".join(items_list)
-
-    new_item_desc = (
-        f"{new_item.get('name', 'Item')} — {new_item.get('category', '?')}, "
-        f"Color: {new_item.get('color', '?')}, Style: {new_item.get('style', '?')}, "
-        f"Sub: {new_item.get('subcategory', '?')}"
-    )
-
-    if client:
-        try:
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=800,
-                messages=[{
-                    "role": "user",
-                    "content": f"""You are an expert fashion stylist for "Styligma ✧".
-
-A user is considering BUYING this new item:
-NEW ITEM: {new_item_desc}
-
-Their current WARDROBE:
-{items_text}
-
-TASK: Determine how well this new item fits into their existing wardrobe.
-
-1. Find ALL wardrobe items that would pair well with this new item
-2. Suggest up to 3 complete outfits using the new item + wardrobe items
-3. Give a verdict: is this a SMART BUY or redundant?
-
-Return ONLY JSON:
-{{
-  "match_count": <number of items that pair well>,
-  "matching_indices": [list of wardrobe indices that pair with the new item],
-  "outfits": [
-    {{
-      "wardrobe_indices": [indices from wardrobe to combine with new item],
-      "description": "Short outfit description"
-    }}
-  ],
-  "verdict": "SMART BUY: <reason>" or "SKIP: <reason>" or "MAYBE: <reason>",
-  "color_harmony": "Brief note on how the new item's color works with wardrobe",
-  "style_fit": "How well it matches the user's overall style"
-}}
-
-Be honest — if the user already has something similar, say SKIP. If it fills a gap, say SMART BUY.
-ONLY JSON, nothing else.""",
-                }],
-            )
-
-            pick_text = response.content[0].text.strip()
-
-            match = re.search(r'\{.*\}', pick_text, re.DOTALL)
-            if not match:
-                raise ValueError("Claude didn't return valid JSON")
-
-            result = json.loads(match.group(0))
-
-            valid_matches = [i for i in result.get("matching_indices", []) if 0 <= i < len(wardrobe)]
-            valid_outfits = []
-            for outfit in result.get("outfits", [])[:3]:
-                valid_idx = [i for i in outfit.get("wardrobe_indices", []) if 0 <= i < len(wardrobe)]
-                if valid_idx:
-                    valid_outfits.append({
-                        "wardrobe_indices": valid_idx,
-                        "description": outfit.get("description", ""),
-                    })
-
-            return {
-                "match_count": len(valid_matches),
-                "matching_indices": valid_matches,
-                "outfits": valid_outfits,
-                "verdict": result.get("verdict", "Looks like a versatile addition."),
-                "color_harmony": result.get("color_harmony", ""),
-                "style_fit": result.get("style_fit", ""),
-            }
-        except Exception as e:
-            print(f"Match item failed: {e}")
-
-    new_cat = new_item.get("category", "")
-    matches = []
-    for i, item in enumerate(wardrobe):
-        cat = item.get("category", "")
-        if cat != new_cat:
-            matches.append(i)
-
-    return {
-        "match_count": len(matches),
-        "matching_indices": matches[:10],
-        "outfits": [],
-        "verdict": f"This pairs with {len(matches)} items in your wardrobe.",
-        "color_harmony": "",
-        "style_fit": "",
-    }
+    from wardrobe_compatibility import assess
+    try:
+        return await asyncio.to_thread(assess, request)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
 
 @app.post("/vacation-list")
