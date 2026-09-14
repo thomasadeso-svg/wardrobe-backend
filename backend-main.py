@@ -45,7 +45,7 @@ async def root():
         "service": "styligma-v2",
         "outfit_api_version": 2,
         "compatibility_api_version": 1,
-        "outfit_features": ["batches", "exact_item_anchor", "hot_outerwear_anchor"],
+        "outfit_features": ["batches", "exact_item_anchor", "hot_outerwear_anchor", "complementary_accessories_v1"],
         "endpoints": [
             "/remove-background",
             "/analyze-clothing",

@@ -31,7 +31,7 @@ def environment(frames, fps=2, count=None):
         release=lambda: setattr(cap, "released", True))
     calls = []
 
-    def process(img, idx, temp_id):
+    def process(img, idx, temp_id, classification_cache=None):
         calls.append(idx)
         return {"temp_id": temp_id, "category": "shoes", "subcategory": "sneakers",
                 "color": "black", "_frame_index": idx, "_crop_sig": 0, "_sharpness": 30}
@@ -46,15 +46,39 @@ def environment(frames, fps=2, count=None):
         TRACK_SIMILARITY_THRESHOLD=20, TRACK_DEBUG=False,
         _sharpness=lambda f: f.score, _process_single_frame_sync=process,
         _palette_matches=lambda a, b: a is not None and a == b,
+        SourceContinuity=lambda: SimpleNamespace(advance=lambda *args: None),
+        reconcile_backward=lambda *args: None,
         _crop_distance=lambda a, b: abs(a-b), _colors_compatible=lambda a, b: a == b,
         DetectedItem=lambda **kw: kw)
-    names = {"_scan_event", "_process_video_sync", "_build_garment_tracks", "_candidate_view"}
+    names = {"_scan_event", "_process_video_sync", "_build_garment_tracks", "_candidate_view", "_subtype_family",
+             "_source_view", "_reconnect_source_tracks"}
     nodes = [n for n in ast.parse(SOURCE).body if isinstance(n, ast.FunctionDef) and n.name in names]
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<actual-source>", "exec"), env)
     return env, calls, cap
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_boot_label_drift_is_reviewable_and_clearer_crop_is_selected(self):
+        env, _, _ = environment([])
+        env['_geometric_duplicate'] = lambda *args: False
+        def boot(i, label, sharpness):
+            return dict(temp_id=str(i), image_base64=str(i), category='shoes',
+                        subcategory=label, color='black', _palette='black',
+                        _frame_index=i, _timestamp_seconds=i*.5, _crop_sig=i*25,
+                        _sharpness=sharpness, confidence='high')
+        result = env['_build_garment_tracks']([boot(0, 'sock boots', 30), boot(1, 'ankle boots', 50)])
+        self.assertEqual(len(result), 2)  # Similar real shoes remain recoverable.
+        self.assertEqual(result[0]['possible_duplicate_of'], '1')
+        self.assertEqual(result[0]['confidence'], 'low')
+        self.assertNotIn('possible_duplicate_of', result[1])
+
+    def test_ghosted_crop_does_not_win_on_sharp_edges(self):
+        env, _, _ = environment([])
+        a = dict(temp_id='a', category='shoes', _frame_index=0, _crop_sig=0,
+                 _sharpness=100, _visibility=.2)
+        b = dict(a, temp_id='b', _frame_index=1, _sharpness=30, _visibility=.9)
+        self.assertEqual(env['_build_garment_tracks']([a, b])[0]['temp_id'], 'b')
+
     def test_nonadjacent_exact_frames_reuse_processing_without_dropping_distinct_frame(self):
         env, calls, _ = environment([Frame(b'a', 30), Frame(b'b', 30), Frame(b'a', 30)])
         report = []

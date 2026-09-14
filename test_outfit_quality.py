@@ -4,6 +4,15 @@ from outfit_engine import build_batch
 
 
 class QualityTests(unittest.TestCase):
+    def test_fallback_names_actual_attributes_and_whitespace_ai_is_empty(self):
+        request = self.request()
+        request['wardrobe'][0].update(name='Blue shirt', color='blue')
+        result = build_batch(request, lambda _: {'outfits': [
+            {'item_ids': ['formal', 'bottom'], 'explanation': '  ', 'styling_tip': '\n'}]})
+        self.assertIn('Blue shirt (blue, formal)', result['explanation'])
+        self.assertIn('top hem', result['styling_tip'])
+        self.assertEqual(result['ai_calls'], 1)
+
     def request(self):
         return {'wardrobe': [{'id': 'formal', 'category': 'top', 'style': 'formal'},
                             {'id': 'sport', 'category': 'top', 'style': 'sporty'},
