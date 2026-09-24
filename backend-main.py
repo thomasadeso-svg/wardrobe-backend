@@ -12,6 +12,8 @@ import random
 import re
 import hashlib
 import requests
+import time
+import uuid
 from PIL import Image, ImageEnhance
 from background_removal import remove_background_bytes
 from video_scan import router as video_scan_router
@@ -38,6 +40,186 @@ vacation_cache = {}
 VALID_ACTIVITIES = {"beach", "dinner", "sightseeing", "nightlife", "hiking", "business", "casual", "workout"}
 
 
+PHOTO_JOB_TTL_SECONDS = 15 * 60
+PHOTO_JOB_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+photo_job_store = {}
+photo_job_tasks = set()
+
+
+def _cleanup_photo_jobs():
+    cutoff = time.time() - PHOTO_JOB_TTL_SECONDS
+    stale_ids = [
+        job_id
+        for job_id, job in photo_job_store.items()
+        if job.get("updated_at", job.get("started_at", 0)) < cutoff
+    ]
+    for job_id in stale_ids:
+        photo_job_store.pop(job_id, None)
+
+
+async def _analyze_clothing_bytes(contents: bytes, content_type: str):
+    if client is None:
+        raise RuntimeError("analysis_unavailable")
+
+    base64_image = base64.b64encode(contents).decode("utf-8")
+
+    def _call_claude():
+        return client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": content_type or "image/jpeg",
+                            "data": base64_image,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": """You are a strict fashion wardrobe gatekeeper. Your ONLY job is to accept real clothing items and fashion accessories, and REJECT everything else.
+
+STEP 1 — Is this a wearable fashion item?
+
+ACCEPTED (return rejected=false):
+Shirts, t-shirts, blouses, sweaters, hoodies, jackets, coats, blazers, vests, pants, jeans, shorts, skirts, dresses, shoes, sneakers, boots, sandals, heels, bags, handbags, backpacks, belts, watches, necklaces, bracelets, rings, earrings, sunglasses, scarves, hats, caps, ties, gloves, socks.
+
+REJECTED (return rejected=true):
+People, selfies, faces, body parts, food, drinks, animals, pets, cars, vehicles, furniture, rooms, buildings, landscapes, electronics, phones, laptops, books, plants, flowers, toys, tools, money, cups, mugs, plates, or ANY object that is not worn on the body. Also reject blurry or unrecognizable images.
+
+When in doubt, REJECT.
+
+If REJECTED, return ONLY this JSON:
+{"rejected": true, "reason": "This doesn't look like a clothing item or accessory. Please photograph a single piece of clothing, shoes, bag, jewelry, or accessory."}
+
+STEP 2 — If ACCEPTED, return ONLY this JSON:
+{
+  "rejected": false,
+  "category": "top" or "bottom" or "dress" or "shoes" or "outerwear" or "bag" or "jewelry" or "accessory",
+  "subcategory": "e.g. t-shirt, jeans, sneakers, jacket, hat, necklace, handbag, sunglasses, belt, watch, scarf",
+  "color": "primary color name",
+  "colors": ["primary", "secondary if any"],
+  "style": "casual" or "formal" or "sporty" or "streetwear" or "elegant" or "bohemian",
+  "season": ["spring", "summer", "fall", "winter"],
+  "fabric_guess": "e.g. cotton, denim, leather, polyester, gold, silver, canvas",
+  "name": "Short descriptive name like 'Black Slim Jeans' or 'Gold Chain Necklace'"
+}
+
+Return ONLY the JSON, no other text.""",
+                    },
+                ],
+            }],
+        )
+
+    message = await asyncio.to_thread(_call_claude)
+    response_text = message.content[0].text.strip()
+    match = re.search(r'\{.*\}', response_text, re.DOTALL)
+    if not match:
+        raise ValueError("invalid_analysis_json")
+    return json.loads(match.group(0))
+
+
+async def _remove_background_job_bytes(input_data: bytes):
+    def _prepare_and_enhance():
+        working = input_data
+        img_input = Image.open(io.BytesIO(working))
+        max_size = 1024
+        if max(img_input.size) > max_size:
+            img_input.thumbnail((max_size, max_size), Image.LANCZOS)
+            resized = io.BytesIO()
+            img_input.convert("RGB").save(resized, format="JPEG", quality=90)
+            working = resized.getvalue()
+        return working
+
+    working = await asyncio.to_thread(_prepare_and_enhance)
+    output_data = await asyncio.to_thread(remove_background_bytes, working, "u2netp")
+
+    def _encode():
+        img = Image.open(io.BytesIO(output_data)).convert("RGBA")
+        r, g, b, a = img.split()
+        rgb_img = Image.merge("RGB", (r, g, b))
+        rgb_img = ImageEnhance.Color(rgb_img).enhance(1.3)
+        rgb_img = ImageEnhance.Contrast(rgb_img).enhance(1.1)
+        r2, g2, b2 = rgb_img.split()
+        enhanced = Image.merge("RGBA", (r2, g2, b2, a))
+        buf = io.BytesIO()
+        enhanced.save(buf, format="PNG")
+        return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+
+    return await asyncio.to_thread(_encode)
+
+
+async def _run_photo_job(job_id: str, contents: bytes, content_type: str):
+    try:
+        analysis_task = asyncio.create_task(_analyze_clothing_bytes(contents, content_type))
+        background_task = asyncio.create_task(_remove_background_job_bytes(contents))
+        analysis, image = await asyncio.gather(analysis_task, background_task)
+
+        if analysis.get("rejected"):
+            result = {"analysis": analysis}
+        else:
+            result = {"analysis": analysis, "image": image}
+
+        photo_job_store[job_id] = {
+            "status": "done",
+            "started_at": photo_job_store.get(job_id, {}).get("started_at", time.time()),
+            "updated_at": time.time(),
+            "result": result,
+        }
+    except Exception as error:
+        # Keep the API response intentionally generic; client diagnostics only
+        # need to know that this individual item can be retried.
+        photo_job_store[job_id] = {
+            "status": "error",
+            "started_at": photo_job_store.get(job_id, {}).get("started_at", time.time()),
+            "updated_at": time.time(),
+            "error": "processing_failed",
+        }
+
+
+@app.post("/process-clothing")
+async def process_clothing(file: UploadFile = File(...)):
+    _cleanup_photo_jobs()
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty image upload.")
+    if len(contents) > PHOTO_JOB_MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Image upload is too large.")
+
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    photo_job_store[job_id] = {
+        "status": "processing",
+        "started_at": now,
+        "updated_at": now,
+    }
+
+    task = asyncio.create_task(
+        _run_photo_job(job_id, contents, file.content_type or "image/jpeg")
+    )
+    photo_job_tasks.add(task)
+    task.add_done_callback(photo_job_tasks.discard)
+
+    return {"job_id": job_id, "status": "processing"}
+
+
+@app.get("/process-clothing-status/{job_id}")
+async def process_clothing_status(job_id: str):
+    _cleanup_photo_jobs()
+    job = photo_job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired clothing job.")
+
+    if job["status"] == "processing":
+        return {"job_id": job_id, "status": "processing"}
+    if job["status"] == "error":
+        return {"job_id": job_id, "status": "error", "error": job.get("error", "processing_failed")}
+    return {"job_id": job_id, "status": "done", "result": job.get("result", {})}
+
+
 @app.get("/")
 async def root():
     return {
@@ -49,6 +231,10 @@ async def root():
         "endpoints": [
             "/remove-background",
             "/analyze-clothing",
+            "/process-clothing",
+            "/process-clothing-status/{job_id}",
+            "/process-clothing",
+            "/process-clothing-status/{job_id}",
             "/generate-outfit",
             "/match-item",
             "/vacation-list",

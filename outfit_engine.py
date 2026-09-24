@@ -112,6 +112,26 @@ def complete(indices, items, weather, anchor=None, complementary=False):
 
 
 def build_batch(request, ask_ai=None):
+    result = _build_batch(request, ask_ai)
+    if 'match_states_v1' in (request.get('client_capabilities') or []):
+        items, _ = prepare(request)
+        shoes = [i for i in items if category(i) == 'shoes']
+        known = all(category(i) in CATEGORIES for i in items)
+        info = result.get('match_info', {})
+        status = 'absent' if known and not shoes else 'unknown'
+        if shoes and known and not info.get('generation_error'):
+            assessments = [match_info([shoe], request, items) for shoe in shoes]
+            if all(a['state'] == 'no_sensible' and 'missing_metadata' not in a['reason_codes'] for a in assessments):
+                status = 'owned_unsuitable'
+            elif any(a['state'] in {'strong', 'best_available'} for a in assessments):
+                status = 'owned_available'
+        for look in [result, *result.get('outfits', [])]:
+            if 'match_info' in look:
+                look['match_info']['footwear_status'] = status
+    return result
+
+
+def _build_batch(request, ask_ai=None):
     started = time.perf_counter()
     items, anchor = prepare(request)
     capabilities = request.get('client_capabilities', [])
@@ -126,8 +146,14 @@ def build_batch(request, ask_ai=None):
                if isinstance(ids, list) and all(isinstance(i, str) for i in ids)] if isinstance(history, list) else []
     core_ids = {item["id"] for item in items if category(item) in MAIN}
     recent = {ids: n + 1 for n, ids in enumerate(history)}
-    recent_core = {ids & core_ids: n + 1 for n, ids in enumerate(history)}
+    anchor_set = {anchor} if anchor else set()
+    recent_core = {(ids & core_ids) - anchor_set: n + 1 for n, ids in enumerate(history)}
     last_used = {item_id: n + 1 for n, ids in enumerate(history) for item_id in ids}
+    # Count repeated supporting garments across the recent window. The selected
+    # anchor is intentionally excluded so Ways to Wear It keeps that piece while
+    # rotating tops/bottoms/dresses, then shoes/outerwear where possible.
+    history_usage = Counter(item_id for ids in history[-12:] for item_id in ids if item_id != anchor)
+    rotation_ids = {item['id'] for item in items if category(item) in CORE | {'outerwear'}} - anchor_set
     groups = {c: sorted([i for i, item in enumerate(items) if category(item) == c],
                         key=lambda i: (last_used.get(items[i]["id"], 0), items[i]["id"]))
               for c in CATEGORIES}
@@ -190,6 +216,7 @@ def build_batch(request, ask_ai=None):
             break
     if not candidates:
         result=empty("Add a dress or a top and bottom to make an outfit.", started)
+        result['complete_catalog'] = exhausted and accessory_catalog_complete
         if match_states:result['match_info']=match_info([],request,items,exhausted)
         return result
 
@@ -198,6 +225,7 @@ def build_batch(request, ask_ai=None):
         wearable={ids:c for ids,c in candidates.items() if assessments[ids]['state']!='no_sensible'}
         if not wearable:
             result=empty('No suitable owned outfit established for this selection.',started)
+            result['complete_catalog'] = exhausted and accessory_catalog_complete
             assessment=next(iter(assessments.values()))
             if not exhausted:
                 assessment=match_info([],request,items,False)
@@ -267,23 +295,31 @@ def build_batch(request, ask_ai=None):
     # Calculate the static scores once, rather than rescoring every garment for
     # each of the five selections in a large wardrobe.
     scores = {ids: evidence([items[by_id[i]] for i in ids], request) for ids in candidates}
-    if match_states:
-        ranks={'strong':0,'best_available':1,'uncertain':2,'no_sensible':3}
-        states={ids:match_info([items[by_id[i]] for i in ids],request,items,exhausted)['state'] for ids in candidates}
-        best_state=min(ranks[s] for s in states.values())
-        candidates={ids:c for ids,c in candidates.items() if ranks[states[ids]]==best_state}
-        scores={ids:s for ids,s in scores.items() if ids in candidates}
-    # Do not fill a batch with known poorer combinations just to reach five.
-    best = min(score[:3] for score in scores.values())
-    candidates = {ids: value for ids, value in candidates.items() if scores[ids][:3] == best}
+    states={ids:match_info([items[by_id[i]] for i in ids],request,items,exhausted)['state'] for ids in candidates} if match_states else {}
+    if not match_states:
+        # Preserve legacy suitability filtering for clients without review states.
+        best = min(score[:3] for score in scores.values())
+        candidates = {ids: value for ids, value in candidates.items() if scores[ids][:3] == best}
+    # Modern candidates already exclude explicit avoid, season and activity conflicts.
+    # Soft style differences must not erase otherwise wearable core alternatives or
+    # make a one-result fallback appear to be the complete valid catalog.
     all_count = len(candidates)
     while candidates and len(chosen) < count:
         def rank(ids):
-            core = ids & core_ids
-            return (*scores[ids], core in used_cores, core in recent_core, ids in recent,
-                    recent_core.get(core, 0), recent.get(ids, 0),
-                    sum(batch_usage[i] for i in core), candidates[ids]["source"] != "ai",
-                    sum(last_used.get(i, 0) for i in core),
+            core = (ids & core_ids) - anchor_set
+            support = ids & rotation_ids
+            score = scores[ids]
+            # Hard evidence stays first. Among wearable candidates, rotate the
+            # supporting garments before soft style preferences so one skirt/top
+            # cannot dominate every reveal merely because it scores one point
+            # better on a preference. Exact anchors remain fixed by complete().
+            return (states.get(ids) in {'uncertain', 'no_sensible', 'unavailable'},
+                    score[0], score[2], core in used_cores, core in recent_core,
+                    sum(batch_usage[i] for i in support),
+                    sum(history_usage.get(i, 0) for i in support),
+                    ids in recent, recent_core.get(core, 0), recent.get(ids, 0),
+                    score[1], score[3], score[4], candidates[ids]["source"] != "ai",
+                    sum(last_used.get(i, 0) for i in support),
                     sum(last_used.get(i, 0) for i in ids), tuple(sorted(ids)))
         ids = min(candidates, key=rank)
         candidate = candidates.pop(ids)
@@ -294,8 +330,8 @@ def build_batch(request, ask_ai=None):
         if match_states:
             chosen[-1]['match_info']=match_info([items[i] for i in candidate['indices']],request,items,
                 exhausted and accessory_catalog_complete,reason in {'timeout','ai_error','malformed_response','rejected_proposals'})
-        used_cores.add(ids & core_ids)
-        batch_usage.update(ids & core_ids)
+        used_cores.add((ids & core_ids) - anchor_set)
+        batch_usage.update(ids & rotation_ids)
     first = chosen[0]
     sources = dict(Counter(o['source'] for o in chosen))
     if accepted and not sources.get('ai'):
