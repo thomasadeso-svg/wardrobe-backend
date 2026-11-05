@@ -647,6 +647,15 @@ async def terms():
     return Path("terms.html").read_text(encoding="utf-8")
 
 
+
+# EXPERIMENTAL: fail-closed, opt-in only. This block is NOT active in production.
+# Production has no STYLIGMA_DURABLE_JOBS_ENABLED flag, and remains on main.
+if os.getenv("STYLIGMA_DURABLE_JOBS_ENABLED") == "1":
+    from types import SimpleNamespace as _StyligmaNamespace
+    from styligma_durable_integration import enable_from_env as _enable_durable_jobs
+    import video_scan as _styligma_video_scan
+    _enable_durable_jobs(app, _StyligmaNamespace(**globals()), _styligma_video_scan)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
