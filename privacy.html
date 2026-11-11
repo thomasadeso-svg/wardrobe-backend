@@ -19,37 +19,40 @@
 <body>
     <div class="container">
         <h1>Privacy Policy</h1>
-        <p class="subtitle">Datenschutzerklärung · Last updated: October 2026</p>
+        <p class="subtitle">Datenschutzerklärung · Last updated: November 11, 2026</p>
 
         <h2>1. Overview</h2>
         <p>Styligma ("we", "our", "the app") takes your privacy seriously. This policy explains what data we collect, how we use it, and your rights regarding your personal data.</p>
 
         <h2>2. Data We Collect</h2>
         <p><strong>Clothing photos:</strong> When you import or match a clothing item, the selected image is uploaded to our Railway-hosted API for background removal and clothing analysis. Some processing sends the image to the Anthropic API. A photo-processing job can temporarily hold the image or result in server memory; we cannot promise immediate deletion after processing. Do not include people or sensitive information in clothing photos.</p>
-        <p><strong>Wardrobe and outfit information:</strong> Your wardrobe is saved on your device, but item descriptions, categories, colors, styling preferences, occasion, weather context, and previous outfit information may be sent to our API and Anthropic to generate outfits or plans. Deleting local wardrobe data does not necessarily erase data already sent to a service provider.</p>
+        <p><strong>Wardrobe and outfit information:</strong> Your wardrobe is saved on your device, but item descriptions, categories, colors, styling preferences, occasion, weather context, previous outfit information, and travel details such as destination, dates and activities may be sent to our API and Anthropic to generate outfits or plans. Deleting local wardrobe data does not necessarily erase data already sent to a service provider.</p>
         <p><strong>Account and purchase identifiers:</strong> No Styligma account is required. RevenueCat processes an app-specific customer identifier and purchase history to provide Pro access, purchases, and Restore. We do not receive your payment card details.</p>
-        <p><strong>Analytics:</strong> If you consent to analytics, PostHog's EU service receives app usage and retention events, such as onboarding, wardrobe and outfit milestones, paywall use, and first-outfit feedback categories. Its SDK assigns an anonymous distinct identifier so events can be associated across sessions. The app does not send free-text feedback to PostHog. Analytics collection is disabled until you opt in.</p>
+        <p><strong>Analytics:</strong> If you consent to analytics, PostHog's EU service receives app usage and retention events, such as onboarding, wardrobe and outfit milestones, paywall and purchase events, and first-outfit feedback ratings/topics. Its SDK assigns an SDK-generated identifier so events can be associated across sessions. The app does not send free-text feedback to PostHog. Analytics collection is disabled until you opt in. Turning analytics off does not erase events already received by PostHog.</p>
         <p><strong>Location and weather:</strong> If you request local weather, the app sends latitude and longitude to Open-Meteo. Vacation planning can also send a destination search and coordinates to Open-Meteo. Coordinates are not rounded by the app before the weather request.</p>
 
         <h2>3. AI Processing</h2>
-        <p>Our Railway-hosted API processes clothing photos and outfit requests. It uses Anthropic Claude for clothing analysis and outfit generation, which can include photos, wardrobe descriptions, styling preferences, and request context. These contents may reveal personal information that appears in a photo or that you enter. Anthropic's standard commercial API policy says inputs and outputs are normally deleted within 30 days, subject to its stated exceptions and any different agreement for our account. We do not claim a shorter period or zero retention.</p>
+        <p>Our Railway-hosted API processes clothing photos and outfit requests. It uses Anthropic Claude for clothing analysis and outfit generation, which can include photos, wardrobe descriptions, styling preferences, and request context. These contents may reveal personal information that appears in a photo or that you enter. Provider retention depends on applicable policies and our account arrangements. We do not promise zero retention or a specific deletion deadline.</p>
 
         <h2>4. Subscriptions</h2>
         <p>Apple's App Store or Google Play handles subscription billing. RevenueCat processes purchase history, subscription status, and an app-specific customer identifier to validate access to Styligma Pro and enable purchases and Restore. We do not receive payment card details.</p>
 
         <h2>5. Data Storage</h2>
-        <p>Wardrobe records are stored on your device. Information sent for AI processing, weather, purchases, or consented analytics is handled by the recipients described here. Photo-processing jobs may remain temporarily in API memory; platform logs and provider-held data may remain after the request ends. Railway log retention depends on the service plan, PostHog event retention depends on project settings, and Anthropic retention depends on its API policy and our account agreement. We cannot guarantee that deleting the app removes data already held by these providers. Contact us for data-access or deletion requests.</p>
+        <p>Wardrobe records and saved plans are stored on your device. Styligma does not provide cloud backup, automatic recovery or cross-device synchronization. Uninstalling can remove local data. Information sent for AI processing, weather, purchases, or consented analytics is handled by the recipients described here. Photo-processing jobs and trip-result caches may remain in API memory; platform logs and provider-held data may remain after the request ends. Railway log retention depends on the service plan, PostHog event retention depends on project settings, and Anthropic retention depends on its API policy and our account agreement. We cannot guarantee that deleting the app removes data already held by these providers. Contact us for data-access or deletion requests.</p>
 
         <h2>6. Third-Party Services</h2>
         <p>The following third-party services process limited data on our behalf:</p>
         <p><strong>Railway:</strong> Hosts our API and may retain request or application logs according to our plan and logging configuration.</p>
         <p><strong>Anthropic Claude AI:</strong> Processes clothing photographs and outfit-generation context.</p>
-        <p><strong>PostHog (EU hosted):</strong> Receives consent-based usage events and an anonymous distinct identifier.</p>
-        <p><strong>Open-Meteo:</strong> Receives weather coordinates and vacation destination searches. Its published policy says API logs can contain coordinates and are deleted after 90 days.</p>
+        <p><strong>PostHog (EU hosted):</strong> Receives consent-based usage events and an SDK-generated identifier.</p>
+        <p><strong>Open-Meteo:</strong> Receives weather coordinates and vacation destination searches. Travel weather requests also include dates. Retention depends on its policies; we do not promise a specific deletion deadline.</p>
         <p><strong>RevenueCat:</strong> Processes app-specific customer identifiers and subscription history. Apple or Google processes the associated store purchase.</p>
 
+        <p><strong>Wikipedia and Wikimedia:</strong> Destination-photo lookup sends the destination name to Wikipedia and fetches image metadata and photographs from Wikimedia. Receiving services also receive connection information such as your IP address. Opening external shopping or attribution links contacts the linked website.</p>
+        <p><strong>Support:</strong> If you contact us, we receive the information you send, including your contact details.</p>
+
         <h2>7. Your Rights (GDPR / DSGVO)</h2>
-        <p>Under the GDPR/DSGVO, you may have rights to access, delete, and export personal data. "Delete All Wardrobe Data" in Settings removes the local wardrobe; it does not automatically erase data already sent to service providers. Contact us to request help with data held by our providers.</p>
+        <p>Under the GDPR/DSGVO, you may have rights to access, delete, and export personal data. "Clear Wardrobe and Favorites" in Settings removes those entries from the app; it does not delete local photo files, Calendar plans, trips, settings or purchases. It does not erase data already sent to service providers. Contact us for access or deletion requests concerning data sent to our services; applicable retention requirements may limit deletion.</p>
 
         <h2>8. Children's Privacy</h2>
         <p>Styligma is not directed at children under 13. We do not knowingly collect data from children.</p>
